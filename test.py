@@ -4,7 +4,7 @@ from loader import create_hest_dataloader, CustomSample  # import from loader.py
 from model import MultiModalHestModel
 
 def run_sanity_check():
-    # 1. Load data (same logic as previous working version)
+    # 1. Load data 
     root = "/workspace/Temp"
     id_list = ["TENX24", "TENX39", "TENX97", "MISC61", "TENX153"]
     
@@ -68,3 +68,4 @@ def run_sanity_check():
 
 if __name__ == "__main__":
     run_sanity_check()
+
