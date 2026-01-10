@@ -107,12 +107,14 @@ class WSIDataset(Dataset):
         patch_indices = np.array(patch_indices)
         st_indices = np.array(st_indices)
 
-        # Get aligned data (ordered by ST)
+        # Get aligned data
         images = imgs[patch_indices]           # (N_matched, H, W, 3)
         expr = expr[st_indices]                # (N_matched, n_selected_genes)
         coords = coords_st[st_indices]         # (N_matched, 2)
 
-        # 4. WSI-level label
+        # -----------------------------
+        # WSI-level label
+        # -----------------------------
         if self.use_label:
             meta = sample.metadata
             label_map = {"Healthy": 0, "Tumor": 1, "Cancer": 1}
@@ -122,15 +124,16 @@ class WSIDataset(Dataset):
         else:
             label = torch.tensor(-1).long() # Dummy
 
-        # 5. To Tensor & Normalize
-        
+        # -----------------------------
+        # To Tensor & Normalize
+        # -----------------------------
         # Image: [0, 255] -> [0, 1], (H,W,C) -> (C,H,W)
         images = torch.tensor(images).permute(0, 3, 1, 2).float() / 255.0
         
         # Expr: Float tensor
         expr = torch.tensor(expr).float()
         
-        # Coords: Normalize to [0, 1] per slide (Essential for spatial encoding)
+        # Coords: Normalize to [0, 1] per slide (Spatial Encoding을 위해 필수)
         coords = torch.tensor(coords).float()
         if coords.shape[0] > 1:
             c_min = coords.min(dim=0, keepdim=True)[0]
@@ -167,7 +170,7 @@ def create_wsi_dataloader(samples, gene_indices=None, batch_size=1, shuffle=True
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0, 
+        num_workers=0, # h5py 충돌 방지
         pin_memory=True,
         collate_fn=wsi_collate_fn
     )
@@ -177,35 +180,59 @@ def create_wsi_dataloader(samples, gene_indices=None, batch_size=1, shuffle=True
 # 4) Preprocessing 
 # -------------------------------------------------------
 def preprocess_and_align_genes(samples):
-    """
-    Align common genes for each samples (WSI) after intersection 
-    and normalize for scaling gene expression value. 
-    """
-    print("Alignment & Normalization...")
-    
-    # 1. Intersection
-    common_genes = set(samples[0].adata.var_names)
+    # 1. Intersection 
+    common_genes_intersect = set(samples[0].adata.var_names)
     for s in samples[1:]:
-        common_genes &= set(s.adata.var_names)
+        common_genes_intersect &= set(s.adata.var_names)
     
-    common_genes = sorted(list(common_genes))
-    print(f" - Common genes (Intersection): {len(common_genes)}")
+    print(f"Intersection: {len(common_genes_intersect)} genes")
     
-    # If common genes are too small -> Unify
-    if len(common_genes) < 100:
-        print("Warning: Too few common genes!")
-    
-    # 2. Slice & Normalize each sample
-    for s in samples:
-        # Slice common genes
-        s.adata = s.adata[:, common_genes].copy()
+    # 2. Union 
+    if len(common_genes_intersect) < 1000:
+        print("Too few genes, using UNION strategy...")
         
-        # Normalization (Log1p)
-        if np.max(s.adata.X) > 20: 
+        all_genes = set()
+        for s in samples:
+            all_genes |= set(s.adata.var_names)
+        all_genes = sorted(list(all_genes)) # union gene vocab
+        
+        for s in samples:
+            current_genes = s.adata.var_names.tolist()
+            missing_genes = [g for g in all_genes if g not in current_genes]
+            
+            if missing_genes:
+                # fill with 0
+                n_obs = s.adata.n_obs
+                n_missing = len(missing_genes)
+                
+                if sp.issparse(s.adata.X):
+                    zero_matrix = sp.csr_matrix((n_obs, n_missing))
+                    new_X = sp.hstack([s.adata.X, zero_matrix])
+                else:
+                    new_X = np.hstack([s.adata.X, np.zeros((n_obs, n_missing))])
+                
+                new_var = pd.DataFrame(index=current_genes + missing_genes)
+                s.adata = AnnData(X=new_X, obs=s.adata.obs, var=new_var, obsm=s.adata.obsm)
+            
+            s.adata = s.adata[:, all_genes]
+        
+        common_genes = all_genes
+        print(f"Union: {len(common_genes)} genes")
+    else:
+            common_genes = sorted(list(common_genes_intersect))
+        
+            print(f"Intersection strategy selected.")
+            print(f" - Keeping {len(common_genes)} common genes.")
+
+            # Slicing
+            for s in samples:
+                s.adata = s.adata[:, common_genes]
+    # Normalize
+    for s in samples:
+        if np.max(s.adata.X) > 20:
             sc.pp.normalize_total(s.adata, target_sum=1e4)
             sc.pp.log1p(s.adata)
-            
-    print(" - All samples aligned and normalized.")
+    
     return common_genes
 
 def select_hvg_indices(samples, n_top_genes=512):
@@ -234,11 +261,11 @@ def select_hvg_indices(samples, n_top_genes=512):
 
 
 # -------------------------------------------------------
-# 5) Main 
+# 5) Main Check
 # -------------------------------------------------------
 if __name__ == "__main__":
     root_dir = "/workspace/Temp/ver1" 
-    target_ids = ["TENX24", "TENX39"] 
+    target_ids = ["TENX24", "TENX39", "TENX97", "MISC61", "TENX153"]
 
     # 1. Load Samples
     samples = []
