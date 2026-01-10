@@ -139,7 +139,7 @@ class WSIDataset(Dataset):
             c_min = coords.min(dim=0, keepdim=True)[0]
             c_max = coords.max(dim=0, keepdim=True)[0]
             c_range = c_max - c_min
-            c_range[c_range == 0] = 1.0 # division by zero 방지
+            c_range[c_range == 0] = 1.0
             coords = (coords - c_min) / c_range
         else:
             coords = torch.zeros_like(coords)
@@ -170,7 +170,7 @@ def create_wsi_dataloader(samples, gene_indices=None, batch_size=1, shuffle=True
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0, # h5py 충돌 방지
+        num_workers=0,
         pin_memory=True,
         collate_fn=wsi_collate_fn
     )
