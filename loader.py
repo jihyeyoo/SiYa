@@ -107,15 +107,12 @@ class WSIDataset(Dataset):
         patch_indices = np.array(patch_indices)
         st_indices = np.array(st_indices)
 
-        # Get aligned data
-        # 정렬 순서는 ST 데이터 기준이 됩니다. (shuffle 필요 없음, 공간 구조 유지 위해)
+        # Get aligned data (ordered by ST)
         images = imgs[patch_indices]           # (N_matched, H, W, 3)
         expr = expr[st_indices]                # (N_matched, n_selected_genes)
         coords = coords_st[st_indices]         # (N_matched, 2)
 
-        # -----------------------------
-        # WSI-level label
-        # -----------------------------
+        # 4. WSI-level label
         if self.use_label:
             meta = sample.metadata
             label_map = {"Healthy": 0, "Tumor": 1, "Cancer": 1}
@@ -125,16 +122,15 @@ class WSIDataset(Dataset):
         else:
             label = torch.tensor(-1).long() # Dummy
 
-        # -----------------------------
-        # To Tensor & Normalize
-        # -----------------------------
+        # 5. To Tensor & Normalize
+        
         # Image: [0, 255] -> [0, 1], (H,W,C) -> (C,H,W)
         images = torch.tensor(images).permute(0, 3, 1, 2).float() / 255.0
         
         # Expr: Float tensor
         expr = torch.tensor(expr).float()
         
-        # Coords: Normalize to [0, 1] per slide (Spatial Encoding을 위해 필수)
+        # Coords: Normalize to [0, 1] per slide (Essential for spatial encoding)
         coords = torch.tensor(coords).float()
         if coords.shape[0] > 1:
             c_min = coords.min(dim=0, keepdim=True)[0]
@@ -143,7 +139,6 @@ class WSIDataset(Dataset):
             c_range[c_range == 0] = 1.0 # division by zero 방지
             coords = (coords - c_min) / c_range
         else:
-            # spot이 1개면 0.5로 두거나 그대로
             coords = torch.zeros_like(coords)
 
         return {
@@ -159,10 +154,8 @@ class WSIDataset(Dataset):
 # 2) Collate Fn
 # -------------------------------------------------------
 def wsi_collate_fn(batch):
-    # Batch size가 1이면 딕셔너리 그대로 반환
     if len(batch) == 1:
         return batch[0]
-    # Batch size > 1 이면 리스트로 반환 (각 WSI의 spot 개수가 다르므로 stack 불가)
     return batch
 
 # -------------------------------------------------------
@@ -174,7 +167,7 @@ def create_wsi_dataloader(samples, gene_indices=None, batch_size=1, shuffle=True
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=0, # h5py 충돌 방지
+        num_workers=0, 
         pin_memory=True,
         collate_fn=wsi_collate_fn
     )
@@ -222,7 +215,7 @@ def select_hvg_indices(samples, n_top_genes=512):
     """
     print(f"Selecting top {n_top_genes} HVGs...")
     
-    # 임시로 concat하여 HVG 계산
+    # Concat
     adatas = [s.adata for s in samples]
     adata_concat = sc.concat(adatas, label="sample_id")
     
@@ -241,7 +234,7 @@ def select_hvg_indices(samples, n_top_genes=512):
 
 
 # -------------------------------------------------------
-# 5) Main Check
+# 5) Main 
 # -------------------------------------------------------
 if __name__ == "__main__":
     root_dir = "/workspace/Temp/ver1" 
