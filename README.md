@@ -12,11 +12,11 @@ Ensure your data root folder (e.g., `hest_data/`) follows this hierarchy:
 hest_data/
 ├── TENX24/                       # Sample ID (Slide Name)
 │   ├── st/
-│   │   └── st.h5ad               # [Required] Spatial Transcriptomics data (AnnData format)
+│   │   └── st.h5ad               # Spatial Transcriptomics data (AnnData format)
 │   ├── patches/
-│   │   └── patches.h5            # [Required] H&E Image patches & coordinates (h5 format)
+│   │   └── patches.h5            # H&E Image patches & coordinates (h5 format)
 │   └── metadata/
-│       └── metadata.json         # [Optional] Clinical metadata (e.g., disease_state)
+│       └── metadata.json         # Clinical metadata (e.g., disease_state)
 │
 ├── TENX39/
 │   ├── st/
