@@ -72,8 +72,8 @@ class WSIDataset(Dataset):
             expr = adata.X
 
         # Filter HVG gene with index
-        if self.gene_indices is not None:
-            expr = expr[:, self.gene_indices]
+        #if self.gene_indices is not None:
+        #    expr = expr[:, self.gene_indices]
 
         barcodes_st = adata.obs_names.to_numpy()
         coords_st = adata.obsm["spatial"]
@@ -214,7 +214,7 @@ def preprocess_and_align_genes(samples):
                 new_var = pd.DataFrame(index=current_genes + missing_genes)
                 s.adata = AnnData(X=new_X, obs=s.adata.obs, var=new_var, obsm=s.adata.obsm)
             
-            s.adata = s.adata[:, all_genes]
+            s.adata = s.adata[:, all_genes].copy()
         
         common_genes = all_genes
         print(f"Union: {len(common_genes)} genes")
@@ -245,6 +245,7 @@ def select_hvg_indices(samples, n_top_genes=512):
     # Concat
     adatas = [s.adata for s in samples]
     adata_concat = sc.concat(adatas, label="sample_id")
+    adata_concat.obs_names_make_unique()
     
     # Compute HVG 
     sc.pp.highly_variable_genes(adata_concat, n_top_genes=n_top_genes, batch_key="sample_id")
