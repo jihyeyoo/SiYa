@@ -1,4 +1,4 @@
-# Repo for EWHA Capstone Design Project
+# Repo for SiYa Project
 
 ## 📂 Data Preparation
 
