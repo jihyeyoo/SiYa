@@ -1,93 +1,90 @@
 import os
-import json
 import h5py
 import scanpy as sc
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import scipy.sparse as sp
 import pandas as pd
-from anndata import AnnData
 
 # -------------------------------------------------------
-# 0) Custom Sample class
+# 0) Custom Sample class 
 # -------------------------------------------------------
 class CustomSample:
     def __init__(self, root, sample_id):
+        """
+        Load preprocessed sample
+        - ST data is already normalized, log-transformed, HVG-filtered
+        - Metadata is in adata.obs
+        """
         self.sample_id = sample_id
         
-        st_path = os.path.join(root, sample_id, "st", "st.h5ad")
-        patch_path = os.path.join(root, sample_id, "patches", "patches.h5")
-        meta_path = os.path.join(root, sample_id, "metadata", "metadata.json")
+        st_path = os.path.join(
+            root,
+            "st_preprocessed",
+            f"{sample_id}.h5ad"
+        )
 
+        patch_path = os.path.join(
+            root,
+            "patches",
+            f"{sample_id}.h5"
+        )
         if not os.path.exists(st_path):
             raise FileNotFoundError(f"{st_path} not found.")
         if not os.path.exists(patch_path):
             raise FileNotFoundError(f"{patch_path} not found.")
 
+        # Load preprocessed AnnData
         self.adata = sc.read_h5ad(st_path)
+        # Already: normalized, log-transformed, HVG-filtered (2000 genes)
         
-        # Make names unique for gene and spot
-        self.adata.var_names_make_unique()
-        self.adata.obs_names_make_unique()
-
+        # Patches
         self.patches = h5py.File(patch_path, "r")
-
-        if os.path.exists(meta_path):
-            with open(meta_path, "r") as f:
-                self.metadata = json.load(f)
-        else:
-            self.metadata = {}
+        
+        # Metadata from adata.obs (already embedded)
+        # disease_state: 0 (Healthy) or 1 (Tumor)
+        # No need for separate metadata.json!
 
 # -------------------------------------------------------
-# 1) WSI-level Dataset
+# 1) WSI-level Dataset 
 # -------------------------------------------------------
 class WSIDataset(Dataset):
-    def __init__(self, samples, gene_indices=None, use_label=True):
+    def __init__(self, samples, max_spots=2000, use_label=True):
         """
         Args:
-            samples (WSI from CustomSample)
-            gene_indices: HVG index
-            use_label
+            samples: List of CustomSample objects
+            max_spots: Max spots to load per WSI (memory saving)
+            use_label: Whether to return labels
         """
         self.samples = samples
-        self.gene_indices = gene_indices
+        self.max_spots = max_spots
         self.use_label = use_label
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # one WSI
         sample = self.samples[idx]
-
-        # 1. ST data
         adata = sample.adata
-        
-        # Expr matrix handling : spot_num * gene_num
-        # Sparse to dense
-        if sp.issparse(adata.X):
+
+        # 1. ST data (already preprocessed!)
+        # Already: normalized, log1p, HVG-filtered
+        if hasattr(adata.X, 'toarray'):
             expr = adata.X.toarray()
         else:
             expr = adata.X
-
-        # Filter HVG gene with index
-        #if self.gene_indices is not None:
-        #    expr = expr[:, self.gene_indices]
-
+        
         barcodes_st = adata.obs_names.to_numpy()
         coords_st = adata.obsm["spatial"]
 
-        # 2. Patch
+        # 2. Patch data
         patches = sample.patches
-        imgs = patches["img"]               # (N_patch, H, W, 3)
-        raw_bar = patches["barcode"]
+        imgs = patches["img"]
+        raw_bar = np.array(patches["barcode"])
         
-        # Decode barcodes
-        raw_bar_np = np.array(raw_bar)
         patch_barcodes = [
             b.decode() if isinstance(b, bytes) else str(b)
-            for b in raw_bar_np.squeeze()
+            for b in raw_bar.squeeze()
         ]
         b2i = {b: i for i, b in enumerate(patch_barcodes)}
 
@@ -101,39 +98,42 @@ class WSIDataset(Dataset):
                 st_indices.append(i)
 
         if len(patch_indices) == 0:
-            # If no matching exists
-            raise RuntimeError(f"No aligned spots found in {sample.sample_id}")
+            raise RuntimeError(f"No aligned spots in {sample.sample_id}")
 
         patch_indices = np.array(patch_indices)
         st_indices = np.array(st_indices)
 
         # Get aligned data
-        images = imgs[patch_indices]           # (N_matched, H, W, 3)
-        expr = expr[st_indices]                # (N_matched, n_selected_genes)
-        coords = coords_st[st_indices]         # (N_matched, 2)
-
-        # -----------------------------
-        # WSI-level label
-        # -----------------------------
-        if self.use_label:
-            meta = sample.metadata
-            label_map = {"Healthy": 0, "Tumor": 1, "Cancer": 1}
-            # If no disease_state key exists
-            l_val = label_map.get(meta.get("disease_state", "Healthy"), 0)
-            label = torch.tensor(l_val).long()
-        else:
-            label = torch.tensor(-1).long() # Dummy
-
-        # -----------------------------
-        # To Tensor & Normalize
-        # -----------------------------
-        # Image: [0, 255] -> [0, 1], (H,W,C) -> (C,H,W)
-        images = torch.tensor(images).permute(0, 3, 1, 2).float() / 255.0
+        images = imgs[patch_indices]
+        expr = expr[st_indices]
+        coords = coords_st[st_indices]
         
-        # Expr: Float tensor
+        # 4. Sampling (if too many spots)
+        N = len(images)
+        if self.max_spots is not None and N > self.max_spots:
+            sample_indices = np.linspace(0, N-1, self.max_spots, dtype=int)
+            images = images[sample_indices]
+            expr = expr[sample_indices]
+            coords = coords[sample_indices]
+
+        # 5. Label (from adata.obs)
+        if self.use_label:
+            # disease_state already in adata.obs as 0 or 1
+            # Take first value (all spots have same slide-level label)
+            disease_state = adata.obs['disease_state'].values[0]
+            
+            if pd.isna(disease_state):
+                label = torch.tensor(0).long()  # Default to Healthy
+            else:
+                label = torch.tensor(int(disease_state)).long()
+        else:
+            label = torch.tensor(-1).long()
+
+        # 6. To Tensor
+        images = torch.tensor(images).permute(0, 3, 1, 2).float() / 255.0
         expr = torch.tensor(expr).float()
         
-        # Coords: Normalize to [0, 1] per slide (Spatial Encoding을 위해 필수)
+        # Normalize coords to [0, 1]
         coords = torch.tensor(coords).float()
         if coords.shape[0] > 1:
             c_min = coords.min(dim=0, keepdim=True)[0]
@@ -145,10 +145,10 @@ class WSIDataset(Dataset):
             coords = torch.zeros_like(coords)
 
         return {
-            "images": images,       # (N_spots, 3, 224, 224)
-            "expr": expr,           # (N_spots, n_hvg) -> scBERT input
-            "coords": coords,       # (N_spots, 2) -> Spatial Token
-            "label": label,         # (Scalar) -> WSI Classification Target
+            "images": images,
+            "expr": expr,
+            "coords": coords,
+            "label": label,
             "sample_id": sample.sample_id,
             "num_spots": len(images)
         }
@@ -164,135 +164,91 @@ def wsi_collate_fn(batch):
 # -------------------------------------------------------
 # 3) DataLoader Creator
 # -------------------------------------------------------
-def create_wsi_dataloader(samples, gene_indices=None, batch_size=1, shuffle=True):
-    dataset = WSIDataset(samples, gene_indices=gene_indices, use_label=True)
+def create_wsi_dataloader(samples, batch_size=1, shuffle=True, max_spots=2000):
+    dataset = WSIDataset(samples, max_spots=max_spots, use_label=True)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=False,  # RAM saving
         collate_fn=wsi_collate_fn
     )
     return loader
 
 # -------------------------------------------------------
-# 4) Preprocessing 
+# 4) Get gene info 
 # -------------------------------------------------------
-def preprocess_and_align_genes(samples):
-    # 1. Intersection 
-    common_genes_intersect = set(samples[0].adata.var_names)
-    for s in samples[1:]:
-        common_genes_intersect &= set(s.adata.var_names)
-    
-    print(f"Intersection: {len(common_genes_intersect)} genes")
-    
-    # 2. Union 
-    if len(common_genes_intersect) < 1000:
-        print("Too few genes, using UNION strategy...")
-        
-        all_genes = set()
-        for s in samples:
-            all_genes |= set(s.adata.var_names)
-        all_genes = sorted(list(all_genes)) # union gene vocab
-        
-        for s in samples:
-            current_genes = s.adata.var_names.tolist()
-            missing_genes = [g for g in all_genes if g not in current_genes]
-            
-            if missing_genes:
-                # fill with 0
-                n_obs = s.adata.n_obs
-                n_missing = len(missing_genes)
-                
-                if sp.issparse(s.adata.X):
-                    zero_matrix = sp.csr_matrix((n_obs, n_missing))
-                    new_X = sp.hstack([s.adata.X, zero_matrix])
-                else:
-                    new_X = np.hstack([s.adata.X, np.zeros((n_obs, n_missing))])
-                
-                new_var = pd.DataFrame(index=current_genes + missing_genes)
-                s.adata = AnnData(X=new_X, obs=s.adata.obs, var=new_var, obsm=s.adata.obsm)
-            
-            s.adata = s.adata[:, all_genes].copy()
-        
-        common_genes = all_genes
-        print(f"Union: {len(common_genes)} genes")
-    else:
-            common_genes = sorted(list(common_genes_intersect))
-        
-            print(f"Intersection strategy selected.")
-            print(f" - Keeping {len(common_genes)} common genes.")
-
-            # Slicing
-            for s in samples:
-                s.adata = s.adata[:, common_genes]
-    # Normalize
-    for s in samples:
-        if np.max(s.adata.X) > 20:
-            sc.pp.normalize_total(s.adata, target_sum=1e4)
-            sc.pp.log1p(s.adata)
-    
-    return common_genes
-
-def select_hvg_indices(samples, n_top_genes=512):
+def get_gene_info(samples):
     """
-    Select HVG using scanpy 
-    and return index for corresponding HVG
+    Get gene information from preprocessed data
+    All samples already have same genes (HVG-filtered to 2000)
+    
+    Returns:
+        num_genes: Number of genes
+        gene_names: List of gene names
     """
-    print(f"Selecting top {n_top_genes} HVGs...")
+    sample = samples[0]
+    num_genes = sample.adata.n_vars
+    gene_names = sample.adata.var_names.tolist()
     
-    # Concat
-    adatas = [s.adata for s in samples]
-    adata_concat = sc.concat(adatas, label="sample_id")
-    adata_concat.obs_names_make_unique()
+    print(f"Gene info:")
+    print(f"  Total genes: {num_genes}")
+    print(f"  Gene names (first 10): {gene_names[:10]}")
     
-    # Compute HVG 
-    sc.pp.highly_variable_genes(adata_concat, n_top_genes=n_top_genes, batch_key="sample_id")
-    
-    hvg_mask = adata_concat.var['highly_variable'].values
-    hvg_indices = np.where(hvg_mask)[0] # Index for True spot
-    hvg_names = adata_concat.var_names[hvg_mask].tolist()
-    
-    # Convert to tensor
-    hvg_indices_t = torch.tensor(hvg_indices, dtype=torch.long)
-    
-    print(f" - Selected {len(hvg_indices_t)} genes.")
-    return hvg_indices_t, hvg_names
-
+    return num_genes, gene_names
 
 # -------------------------------------------------------
 # 5) Main Check
 # -------------------------------------------------------
 if __name__ == "__main__":
-    root_dir = "/workspace/Temp/ver1" 
-    target_ids = ["TENX24", "TENX39", "TENX97", "MISC61", "TENX153"]
+    
+    
+    root_dir = "/workspace/Temp/ver1/hest_data"  # Adjust path
+    
+    # List all preprocessed samples
+    st_dir = os.path.join(root_dir, "st_preprocessed")
 
-    # 1. Load Samples
+    sample_ids = [
+        f.replace(".h5ad", "")
+        for f in os.listdir(st_dir)
+        if f.endswith(".h5ad")
+    ]
+
+    
+    print(f"Found {len(sample_ids)} preprocessed samples")
+    print(f"Sample IDs: {sample_ids[:5]}...")
+    
+    # Load samples
     samples = []
-    for sid in target_ids:
+    for sid in sample_ids[:5]:  # Test with first 5
         try:
-            samples.append(CustomSample(root_dir, sid))
-            print(f"Loaded {sid}")
+            s = CustomSample(root_dir, sid)
+            samples.append(s)
+            print(f"✓ Loaded {sid}")
+            print(f"  - Spots: {s.adata.n_obs}")
+            print(f"  - Genes: {s.adata.n_vars}")
+            print(f"  - Label: {s.adata.obs['disease_state'].values[0]}")
         except Exception as e:
-            print(f"Skipped {sid}: {e}")
+            print(f"✗ Failed {sid}: {e}")
 
     if len(samples) > 0:
-        # 2. Preprocess (Align + Normalize)
-        preprocess_and_align_genes(samples)
-
-        # 3. Select HVG Indices
-        hvg_idx, hvg_names = select_hvg_indices(samples, n_top_genes=512)
-
-        # 4. Create DataLoader with HVG filter
-        loader = create_wsi_dataloader(samples, gene_indices=hvg_idx, batch_size=1)
-
-        # 5. Check Output
+        # Get gene info
+        num_genes, gene_names = get_gene_info(samples)
+        
+        # Create DataLoader
+        loader = create_wsi_dataloader(samples, batch_size=1, max_spots=2000)
+        
+        # Check batch
         batch = next(iter(loader))
-        print("\n[Batch Structure Check]")
+        print("\n" + "="*60)
+        print("[Batch Structure Check]")
+        print("="*60)
         print(f"Sample ID: {batch['sample_id']}")
-        print(f"Images   : {batch['images'].shape}")  # (N, 3, 224, 224)
-        print(f"Expr     : {batch['expr'].shape}")    # (N, 512) 
-        print(f"Coords   : {batch['coords'].shape}")  # (N, 2)
-        print(f"Label    : {batch['label']}")         # Scalar
-        print("Sanity Check Passed!")
+        print(f"Images   : {batch['images'].shape}")
+        print(f"Expr     : {batch['expr'].shape}")
+        print(f"Coords   : {batch['coords'].shape}")
+        print(f"Label    : {batch['label']}")
+        print(f"Num spots: {batch['num_spots']}")
+        print("="*60)
+        print("✓ Sanity Check Passed!")
