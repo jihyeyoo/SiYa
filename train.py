@@ -1,175 +1,224 @@
 import os
-import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import pandas as pd
-import numpy as np
+from torch.amp import GradScaler, autocast
+import scanpy as sc
+from collections import Counter
 from tqdm import tqdm
+import gc
 
 from loader import CustomSample, create_wsi_dataloader
 from model import MultiModalMILModel
 
 # -------------------------------------------------------
-# Configuration (Overfitting-oriented setup)
+# Configuration
 # -------------------------------------------------------
 CONFIG = {
     "root_dir": "/workspace/Temp/ver1/hest_data",
-    "epochs": 100,           # Train long enough to fully memorize
-    "lr": 2e-4,             # Slightly increased learning rate
+    "epochs": 50,
+    "lr": 1e-4,
     "embed_dim": 64,
-    "num_genes": 2000,      # (Will be replaced by aligned gene size)
     "num_classes": 2,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    
-    # Memory & Sampling
-    "chunk_size": 16,      # Chunk size
-    "max_spots": 16,       # Increase spots to capture more information (if memory allows)
+    "vocab_size": 500,     
+    "max_spots": 1000,      
+    "batch_spots": 50,      # Move only 50 spots to GPU at a time
+    "accum_steps": 8,       # Gradient accumulation steps
 }
 
 # -------------------------------------------------------
-# Gene alignment (Union strategy - required)
+# Top-K gene list
 # -------------------------------------------------------
-def align_genes_union(samples):
-    print("Aligning genes (Union)...")
-    all_genes = set()
-    for s in samples:
-        all_genes.update(s.adata.var_names)
-    union_genes = sorted(list(all_genes))
+def get_top_k_gene_list(samples, k=500):
+    print(f"Scanning genes from all samples to find Top-{k}...")
+    gene_counter = Counter()
     
-    for s in samples:
-        orig_df = pd.DataFrame(
-            s.adata.X.toarray() if hasattr(s.adata.X, 'toarray') else s.adata.X,
-            index=s.adata.obs_names,
-            columns=s.adata.var_names
-        )
-        # Fill missing genes with zeros
-        new_df = orig_df.reindex(columns=union_genes, fill_value=0.0)
-        
-        # Overwrite AnnData while preserving metadata
-        import scanpy as sc
-        new_adata = sc.AnnData(X=new_df.values, obs=s.adata.obs)
-        new_adata.var_names = union_genes
-        new_adata.obsm = s.adata.obsm
-        s.adata = new_adata
-        
-    return len(union_genes)
+    for s in tqdm(samples[:20], desc="Scanning Genes"):  # Scan only first 20 samples
+        try:
+            adata = sc.read_h5ad(s.st_path, backed='r')
+            gene_counter.update(adata.var_names)
+            del adata
+        except Exception as e:
+            print(f"Skipping {s.sample_id}: {e}")
+    
+    most_common = gene_counter.most_common(k)
+    top_genes = sorted([gene for gene, _ in most_common])
+    
+    print(f" -> Selected {len(top_genes)} genes.")
+    return top_genes
 
 # -------------------------------------------------------
-# Training Function
+# Training Function (memory-optimized version)
 # -------------------------------------------------------
-def train_overfit(cfg):
-    # Fix random seeds for reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
-
+def train(cfg):
     device = cfg["device"]
-    print(f"Using device: {device}")
-
-    # 1. Load and select samples (2 Tumor, 2 Healthy)
+    torch.cuda.empty_cache()
+    
+    # 1. Load samples
     st_dir = os.path.join(cfg["root_dir"], "st_preprocessed")
     all_files = [f for f in os.listdir(st_dir) if f.endswith(".h5ad")]
     
     samples = []
-    tumor_cnt, healthy_cnt = 0, 0
-    
-    print("\nLoading Samples for Overfitting...")
-    for fname in all_files:
-        if tumor_cnt >= 2 and healthy_cnt >= 2:
-            break
-            
-        sid = fname.replace(".h5ad", "")
+    print(f"Loading {len(all_files)} sample headers...")
+    for fname in tqdm(all_files):
         try:
-            s = CustomSample(cfg["root_dir"], sid)
-            label = s.adata.obs['disease_state'].values[0]
-            
-            # Collect 2 Tumor (1) and 2 Healthy (0) samples
-            if label == 1 and tumor_cnt < 2:
-                samples.append(s)
-                tumor_cnt += 1
-                print(f" + [Tumor] {sid} loaded")
-            elif label == 0 and healthy_cnt < 2:
-                samples.append(s)
-                healthy_cnt += 1
-                print(f" + [Normal] {sid} loaded")
-                
+            sid = fname.replace(".h5ad", "")
+            samples.append(CustomSample(cfg["root_dir"], sid))
         except Exception as e:
-            print(f"Skip {sid}: {e}")
-
-    if not samples:
-        print("Error: No samples loaded.")
-        return
-
-    # 2. Gene alignment (Union)
-    real_num_genes = align_genes_union(samples)
-    print(f"Feature aligned! Model input gene dim: {real_num_genes}")
-
-    # 3. DataLoader (shuffle can be enabled even for overfitting)
+            print(f"Failed to load {fname}: {e}")
+    
+    print(f"Successfully loaded {len(samples)} samples")
+    
+    # 2. Get Top-K genes
+    target_genes = get_top_k_gene_list(samples, k=cfg["vocab_size"])
+    num_genes = len(target_genes)
+    
+    # 3. DataLoader
     loader = create_wsi_dataloader(
-        samples, 
-        batch_size=1, 
-        shuffle=True,  # Even for overfitting, shuffling is fine (only 4 samples)
-        max_spots=cfg["max_spots"]
+        samples,
+        batch_size=1,
+        shuffle=True,
+        max_spots=cfg["max_spots"],
+        target_genes=target_genes
     )
-
-    # 4. Model initialization
+    
+    # 4. Model
     model = MultiModalMILModel(
-        num_genes=real_num_genes,  # Aligned gene dimension
+        num_genes=num_genes,
         num_classes=cfg["num_classes"],
         embed_dim=cfg["embed_dim"],
     ).to(device)
-
-    # Disable weight decay for overfitting (no regularization)
-    optimizer = optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=0.0)
+    
+    # Completely freeze the image encoder
+    print("❄️ Freezing Image Encoder...")
+    for param in model.img_encoder.parameters():
+        param.requires_grad = False
+    model.img_encoder.eval()  # Set to eval mode
+    
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg["lr"],
+        weight_decay=1e-4
+    )
     criterion = nn.CrossEntropyLoss()
-
+    scaler = GradScaler('cuda')
+    
     # 5. Training loop
-    print("\n=== Start Overfitting Test ===")
+    print("\n=== Start Training (Memory-Safe Mode) ===")
     
     for epoch in range(cfg["epochs"]):
         model.train()
+        model.img_encoder.eval()  # Image encoder always stays in eval mode
+        
         total_loss = 0
         correct = 0
-        total = 0
+        optimizer.zero_grad()
         
-        # tqdm progress bar
-        loop = tqdm(loader, desc=f"Ep {epoch+1}/{cfg['epochs']}", leave=False)
+        loop = tqdm(loader, desc=f"Ep {epoch+1}/{cfg['epochs']}")
         
-        for batch in loop:
-            images = batch["images"].to(device)
-            expr   = batch["expr"].to(device)
-            coords = batch["coords"].to(device)
-            label  = batch["label"].unsqueeze(0).to(device)  # Shape [1]
-
-            optimizer.zero_grad()
+        for step, batch in enumerate(loop):
+            if batch is None:
+                continue
             
-            # Forward pass
-            logits, _ = model(images, expr, coords)  # [num_classes]
-            
-            # Loss computation
-            loss = criterion(logits.unsqueeze(0), label)
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            pred = logits.argmax().item()
-            correct += (pred == label.item())
-            total += 1
-            
-            loop.set_postfix(loss=loss.item(), acc=100*correct/total)
-
-        avg_loss = total_loss / total
-        avg_acc = 100 * correct / total
+            try:
+                # Prepare data on CPU
+                images_cpu = batch["images"]
+                expr_cpu = batch["expr"]
+                coords_cpu = batch["coords"]
+                label = batch["label"].unsqueeze(0).to(device)
+                
+                N = images_cpu.size(0)
+                batch_spots = cfg["batch_spots"]
+                
+                # Core idea: process spot embeddings in small batches
+                spot_embeds_list = []
+                
+                for i in range(0, N, batch_spots):
+                    j = min(i + batch_spots, N)
+                    
+                    # Move to GPU
+                    img_batch = images_cpu[i:j].to(device)
+                    expr_batch = expr_cpu[i:j].to(device)
+                    coord_batch = coords_cpu[i:j].to(device)
+                    
+                    with autocast('cuda'):
+                        # Do not track gradients for images
+                        with torch.no_grad():
+                            img_feat = model.img_encoder(img_batch)
+                        
+                        # ST encoder is trainable
+                        st_feat = model.st_encoder(expr_batch, coord_batch)
+                        fusion = model.fusion(img_feat, st_feat)
+                    
+                    # Move back to CPU and store (save GPU memory)
+                    spot_embeds_list.append(fusion.detach().cpu())
+                    
+                    # Immediately free GPU memory
+                    del img_batch, expr_batch, coord_batch, img_feat, st_feat, fusion
+                    torch.cuda.empty_cache()
+                
+                # Concatenate on CPU, then move to GPU once
+                spot_embeds = torch.cat(spot_embeds_list, dim=0).to(device)
+                
+                # MIL pooling & loss
+                with autocast('cuda'):
+                    wsi_embed, _ = model.mil_pooling(spot_embeds)
+                    logits = model.classifier(wsi_embed.unsqueeze(0)).squeeze(0)
+                    loss = criterion(logits.unsqueeze(0), label)
+                    loss = loss / cfg["accum_steps"]
+                
+                scaler.scale(loss).backward()
+                
+                # Gradient accumulation
+                if (step + 1) % cfg["accum_steps"] == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()),
+                        1.0
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                
+                # Statistics
+                total_loss += loss.item() * cfg["accum_steps"]
+                pred = logits.argmax().item()
+                correct += (pred == label.item())
+                
+                # Memory cleanup
+                del spot_embeds, wsi_embed, logits, loss
+                torch.cuda.empty_cache()
+                
+                loop.set_postfix(
+                    acc=f"{100*correct/(step+1):.1f}%",
+                    loss=f"{total_loss/(step+1):.4f}"
+                )
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n❌ OOM at step {step}! Skipping batch...")
+                    torch.cuda.empty_cache()
+                    optimizer.zero_grad()
+                    continue
+                else:
+                    raise e
         
-        print(f"Epoch {epoch+1:03d} | Loss: {avg_loss:.6f} | Acc: {avg_acc:.1f}%")
-
-        # Early stop if perfectly overfitted with very low loss
-        if avg_acc == 100.0 and avg_loss < 0.01:
-            print("\n🎉 SUCCESS! Model successfully overfitted.")
-            break
+        avg_loss = total_loss / len(loader)
+        avg_acc = 100 * correct / len(loader)
+        print(f"\nEpoch {epoch+1} Done | Loss: {avg_loss:.4f} | Acc: {avg_acc:.1f}%")
+        
+        # Save checkpoint
+        if (epoch + 1) % 5 == 0:
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+            }, f"checkpoint_epoch_{epoch+1}.pt")
+            print(f"✓ Checkpoint saved")
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()
-    train_overfit(CONFIG)
+    gc.collect()
+    train(CONFIG)
