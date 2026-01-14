@@ -10,67 +10,59 @@ from performer_pytorch import Performer
 class ImageEncoder(nn.Module):
     def __init__(self, embed_dim=256):
         super().__init__()
-        self.backbone = models.resnet18(weights='IMAGENET1K_V1')
+        self.backbone = models.resnet18(weights="IMAGENET1K_V1")
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, embed_dim)
-        
+
     def forward(self, x):
         return self.backbone(x)
 
 # -------------------------------------------------------
-# 2. Spatial ST Encoder (scBERT-style)
+# 2. Spatial ST Encoder (HVG-only scBERT-style)
 # -------------------------------------------------------
 class SpatialSTEncoder(nn.Module):
     """
-    scBERT-based encoder with spatial integration
-    
-    Key Design:
-    - total_vocab_size: Total number of genes
-    - top_k_genes: Number of HVG genes
+    HVG-only scBERT-style encoder with spatial token
+
+    Assumption:
+    - expr is already HVG-filtered
+    - gene indices are 0 ~ K-1
     """
+
     def __init__(
         self,
-        total_vocab_size,    # Total genes in preprocessed data
+        top_k_genes,          # K = number of HVGs
         embed_dim=256,
         num_layers=2,
         num_heads=4,
-        top_k_genes=512,     # HVG count
-        use_value_binning=True,
-        num_bins=5
     ):
         super().__init__()
 
         self.embed_dim = embed_dim
-        self.total_vocab_size = total_vocab_size
         self.top_k_genes = top_k_genes
-        self.use_value_binning = use_value_binning
-        self.num_bins = num_bins
 
-        # Gene Identity Embedding
-        # Size = total_vocab_size 
-        self.gene_embedding = nn.Embedding(total_vocab_size, embed_dim)
-        
-        # Gene Positional Embedding
-        # Size = top_k_genes (0~511)
+        # -------------------------------------------------
+        # Gene identity embedding (HVG-only)
+        # -------------------------------------------------
+        self.gene_embedding = nn.Embedding(top_k_genes, embed_dim)
+
+        # Gene positional embedding
         self.gene_pos_embedding = nn.Embedding(top_k_genes, embed_dim)
 
-        # Expression Value Embedding
-        if use_value_binning:
-            self.value_embedding = nn.Embedding(num_bins, embed_dim)
-        else:
-            self.value_embedding = nn.Sequential(
-                nn.Linear(1, embed_dim),
-                nn.LayerNorm(embed_dim),
-                nn.GELU()
-            )
+        # Continuous expression value embedding (SAFE)
+        self.value_embedding = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
 
-        # Spatial Token Embedding
+        # Spatial token embedding
         self.spatial_embed = nn.Sequential(
             nn.Linear(2, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.GELU()
         )
 
-        # Performer (Efficient Transformer)
+        # Performer Transformer
         self.performer = Performer(
             dim=embed_dim,
             depth=num_layers,
@@ -80,89 +72,49 @@ class SpatialSTEncoder(nn.Module):
             ff_mult=4,
             attn_dropout=0.1,
             ff_dropout=0.1,
-            qkv_bias=True
         )
 
-        # Spatial-Query Pooling
+        # Spatial-query pooling
         self.query_proj = nn.Linear(embed_dim, embed_dim)
-        self.key_proj = nn.Linear(embed_dim, embed_dim)
+        self.key_proj   = nn.Linear(embed_dim, embed_dim)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj   = nn.Linear(embed_dim, embed_dim)
 
-        # Buffer to store selected gene indices
-        self.register_buffer(
-            'selected_gene_indices', 
-            torch.arange(min(top_k_genes, total_vocab_size))
-        )
-        
-    def set_selected_genes(self, gene_indices):
-        """
-        Set HVG indices (from loader)
-        
-        Args:
-            gene_indices: Tensor of shape (K,) where K <= top_k_genes
-                         Values should be in range [0, total_vocab_size)
-        """
-        if gene_indices.device != self.selected_gene_indices.device:
-            gene_indices = gene_indices.to(self.selected_gene_indices.device)
-        
-        # Update buffer
-        if len(gene_indices) <= len(self.selected_gene_indices):
-            self.selected_gene_indices[:len(gene_indices)] = gene_indices
-        else:
-            self.register_buffer('selected_gene_indices', gene_indices)
-        
-    def expression_to_bins(self, expr):
-        """Convert continuous expression to discrete bins"""
-        bins = (expr * self.num_bins).long()
-        bins = torch.clamp(bins, 0, self.num_bins - 1)
-        return bins
-        
     def forward(self, expr, coords):
         """
-        Forward pass
-        
         Args:
-            expr: (B, K) - Expression values of K selected genes
-                  K should match len(selected_gene_indices)
-            coords: (B, 2) - Normalized spatial coordinates
-        
+            expr:   (B, K) HVG expression
+            coords: (B, 2) normalized spatial coordinates
+
         Returns:
-            (B, embed_dim) - Spot-level ST embeddings
+            (B, embed_dim) spot-level ST embedding
         """
         B, K = expr.shape
         device = expr.device
-        
-        # Gene ID Embedding
-        gene_ids = self.selected_gene_indices[:K].unsqueeze(0).expand(B, -1)
-        gene_id_embeds = self.gene_embedding(gene_ids)  # (B, K, embed_dim)
 
-        # Positional Embedding 
-        pos_ids = torch.arange(K, device=device).unsqueeze(0).expand(B, -1)
-        gene_pos_embeds = self.gene_pos_embedding(pos_ids)  # (B, K, embed_dim)
+        assert K <= self.top_k_genes, f"K={K} exceeds top_k_genes={self.top_k_genes}"
 
-        # Value Embedding
-        if self.use_value_binning:
-            bins = self.expression_to_bins(expr)
-            value_embeds = self.value_embedding(bins)
-        else:
-            value_embeds = self.value_embedding(expr.unsqueeze(-1))
+        # Gene IDs: 0 ~ K-1
+        gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(B, -1)
 
-        # Combine: scBERT style
-        gene_embeds = gene_id_embeds + gene_pos_embeds + value_embeds
+        gene_id_embeds  = self.gene_embedding(gene_ids)
+        gene_pos_embeds = self.gene_pos_embedding(gene_ids)
 
-        # Spatial Token
-        spatial_emb = self.spatial_embed(coords).unsqueeze(1)  # (B, 1, embed_dim)
+        value_embeds = self.value_embedding(expr.unsqueeze(-1))
 
-        # Concatenate: [Spatial Token, Gene Tokens]
-        tokens = torch.cat([spatial_emb, gene_embeds], dim=1)  # (B, 1+K, embed_dim)
+        gene_tokens = gene_id_embeds + gene_pos_embeds + value_embeds
 
-        # Performer
+        # Spatial token
+        spatial_token = self.spatial_embed(coords).unsqueeze(1)
+
+        # Token sequence
+        tokens = torch.cat([spatial_token, gene_tokens], dim=1)
+
+        # Transformer
         tokens = self.performer(tokens)
 
-        # Spatial-Query Pooling
-        spatial_out = tokens[:, :1]  # (B, 1, embed_dim)
-        gene_out = tokens[:, 1:]     # (B, K, embed_dim)
+        spatial_out = tokens[:, :1]   # (B,1,D)
+        gene_out    = tokens[:, 1:]   # (B,K,D)
 
         q = self.query_proj(spatial_out)
         k = self.key_proj(gene_out)
@@ -173,8 +125,8 @@ class SpatialSTEncoder(nn.Module):
             dim=-1
         )
 
-        pooled = torch.matmul(attn, v).squeeze(1)  # (B, embed_dim)
-        
+        pooled = torch.matmul(attn, v).squeeze(1)
+
         return self.out_proj(pooled)
 
 # -------------------------------------------------------
@@ -187,12 +139,11 @@ class SpotFusionModule(nn.Module):
             nn.Linear(embed_dim * 2, embed_dim),
             nn.LayerNorm(embed_dim),
             nn.GELU(),
-            nn.Dropout(0.2)
+            nn.Dropout(0.2),
         )
-        
+
     def forward(self, img_feat, st_feat):
-        combined = torch.cat([img_feat, st_feat], dim=-1)
-        return self.fusion(combined)
+        return self.fusion(torch.cat([img_feat, st_feat], dim=-1))
 
 # -------------------------------------------------------
 # 4. MIL Attention Pooling
@@ -200,68 +151,43 @@ class SpotFusionModule(nn.Module):
 class MILAttentionPooling(nn.Module):
     def __init__(self, embed_dim=256, hidden_dim=128):
         super().__init__()
-        
-        self.attention_V = nn.Sequential(
+        self.attn_V = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.Tanh()
         )
-        
-        self.attention_U = nn.Sequential(
+        self.attn_U = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.Sigmoid()
         )
-        
-        self.attention_w = nn.Linear(hidden_dim, 1)
-        
+        self.attn_w = nn.Linear(hidden_dim, 1)
+
     def forward(self, spot_embeds):
-        """
-        Args:
-            spot_embeds: (N_spots, embed_dim)
-        Returns:
-            wsi_embed: (embed_dim,)
-            attn_weights: (N_spots, 1)
-        """
-        A_V = self.attention_V(spot_embeds)
-        A_U = self.attention_U(spot_embeds)
-        A = self.attention_w(A_V * A_U)
-        
-        attn_weights = F.softmax(A, dim=0)
-        wsi_embed = torch.sum(attn_weights * spot_embeds, dim=0)
-        
-        return wsi_embed, attn_weights
+        A = self.attn_w(self.attn_V(spot_embeds) * self.attn_U(spot_embeds))
+        weights = F.softmax(A, dim=0)
+        wsi_embed = torch.sum(weights * spot_embeds, dim=0)
+        return wsi_embed, weights
 
 # -------------------------------------------------------
-# 5. Full Model
+# 5. Full Multi-Modal MIL Model
 # -------------------------------------------------------
 class MultiModalMILModel(nn.Module):
-    """
-    Multi-modal MIL model for WSI classification
-    
-    Pipeline:
-    1. Encode each spot (image + ST with spatial info)
-    2. Fuse modalities at spot level
-    3. Aggregate spots to WSI level using MIL
-    4. Classify WSI
-    """
-    def __init__(self, total_vocab_size, num_classes=2, embed_dim=256,
-                 top_k_genes=512, use_value_binning=True, num_bins=5):
+    def __init__(
+        self,
+        num_classes=2,
+        embed_dim=256,
+        top_k_genes=256,
+    ):
         super().__init__()
-        
-        self.img_encoder = ImageEncoder(embed_dim=embed_dim)
-        
-        self.st_encoder = SpatialSTEncoder(
-            total_vocab_size=total_vocab_size,
-            embed_dim=embed_dim,
-            num_layers=2,
-            num_heads=4,
+
+        self.img_encoder = ImageEncoder(embed_dim)
+        self.st_encoder  = SpatialSTEncoder(
             top_k_genes=top_k_genes,
-            use_value_binning=use_value_binning,
-            num_bins=num_bins
+            embed_dim=embed_dim,
         )
-        
-        self.fusion = SpotFusionModule(embed_dim=embed_dim)
-        self.mil_pooling = MILAttentionPooling(embed_dim=embed_dim, hidden_dim=128)
-        
+
+        self.fusion      = SpotFusionModule(embed_dim)
+        self.mil_pooling = MILAttentionPooling(embed_dim)
+
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim, 128),
             nn.ReLU(),
@@ -270,29 +196,13 @@ class MultiModalMILModel(nn.Module):
         )
 
     def forward(self, images, expr, coords):
-        """
-        Args:
-            images: (N_spots, 3, 224, 224)
-            expr: (N_spots, K) - K = number of HVG genes
-            coords: (N_spots, 2)
-        
-        Returns:
-            logits: (num_classes,)
-            attn_weights: (N_spots, 1)
-        """
-        # Spot-level encoding
-        img_features = self.img_encoder(images)
-        st_features = self.st_encoder(expr, coords)
-        
-        # Spot-level fusion
-        spot_embeds = self.fusion(img_features, st_features)
-        
-        # WSI-level aggregation
-        wsi_embed, attn_weights = self.mil_pooling(spot_embeds)
-        
-        # Classification
+        img_feat = self.img_encoder(images)
+        st_feat  = self.st_encoder(expr, coords)
+
+        spot_embeds = self.fusion(img_feat, st_feat)
+        wsi_embed, attn = self.mil_pooling(spot_embeds)
+
         logits = self.classifier(wsi_embed.unsqueeze(0))
-        
         return logits.squeeze(0), attn_weights
     
     def set_selected_genes(self, gene_indices):
