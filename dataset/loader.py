@@ -19,7 +19,7 @@ def load_global_gene_order(root_dir):
         print(f"✓ Loaded global gene order: {len(global_genes)} genes")
         return global_genes
     else:
-        print("⚠️  global_hvg_genes.txt not found, will infer from first sample")
+        print("global_hvg_genes.txt not found, will infer from first sample")
         return None
 
 
@@ -198,7 +198,7 @@ class WSIDataset(Dataset):
             }
             
         except Exception as e:
-            print(f"⚠️ Error loading {sample.sample_id}: {e}")
+            print(f"Error loading {sample.sample_id}: {e}")
             import traceback
             print(traceback.format_exc())
             raise
