@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 # from local_attention import LocalAttention
 # from performer_pytorch.reversible import ReversibleSequence, SequentialSequence
-from reversible import ReversibleSequence, SequentialSequence
+from models.reversible import ReversibleSequence, SequentialSequence
 try:
     from apex import amp
     APEX_AVAILABLE = True
