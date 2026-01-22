@@ -10,20 +10,34 @@ Ensure your data root folder (e.g., `hest_data/`) follows this hierarchy:
 
 ```text
 hest_data/
-├── TENX24/                       # Sample ID (Slide Name)
-│   ├── st/
-│   │   └── st.h5ad               # Spatial Transcriptomics data (AnnData format)
-│   ├── patches/
-│   │   └── patches.h5            # H&E Image patches & coordinates (h5 format)
-│   └── metadata/
-│       └── metadata.json         # Clinical metadata (e.g., disease_state)
+├── st/                                # Spatial Transcriptomics data
+│   ├── TENX24.h5ad
+│   ├── TENX39.h5ad
+│   ├── TENX97.h5ad
+│   └── ...
 │
-├── TENX39/
-│   ├── st/
-│   │   └── st.h5ad
-│   ├── patches/
-│   │   └── patches.h5
-│   └── metadata/
-│       └── metadata.json
+├── patches/                           # Image patches (H&E)
+│   ├── TENX24.h5
+│   ├── TENX39.h5
+│   ├── TENX97.h5
+│   └── ...
 │
-└── ... (Other samples)
+├── metadata/                          # Clinical / sample-level metadata
+│   ├── TENX24.json
+│   ├── TENX39.json
+│   ├── TENX97.json
+│   └── ...
+│
+├── st_preprocessed_global_hvg/        # ST data filtered with GLOBAL HVGs
+│   ├── TENX24.h5ad
+│   ├── TENX39.h5ad
+│   └── ...
+│
+├── st_preprocessed_sample_hvg/        # (Optional) sample-wise HVG preprocessing
+│   ├── TENX24.h5ad
+│   ├── TENX39.h5ad
+│   └── ...
+│
+├── global_hvg_genes.txt               # Global HVG list (shared gene order)
+└── sample_metadata.csv                # Aggregated sample-level metadata
+
