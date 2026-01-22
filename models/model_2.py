@@ -26,7 +26,7 @@ class ImageEncoder(nn.Module):
 # =======================================================
 class SpatialSTEncoder(nn.Module):
     """
-    scBERT-style encoder with explicit spatial token
+    scBERT-style encoder with an explicit spatial token
 
     Input:
       - expr   : (N_spots, K)   [already HVG-filtered]
@@ -82,7 +82,7 @@ class SpatialSTEncoder(nn.Module):
             ff_dropout=0.1,
         )
 
-        # Spatial-query pooling
+        # Spatial-query pooling projections
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
@@ -96,9 +96,9 @@ class SpatialSTEncoder(nn.Module):
         N, K = expr.shape
         device = expr.device
 
-        # ✅ Top-K gene selection 
+        # Top-K gene selection (memory-efficient)
         if self.top_k_genes and self.top_k_genes < K:
-            # top k gene
+            # Select top-K genes with highest expression per spot
             topk_values, topk_indices = torch.topk(expr, k=self.top_k_genes, dim=1)
             
             gene_embed = self.gene_embedding(topk_indices)  # (N, top_k, D)
@@ -107,7 +107,7 @@ class SpatialSTEncoder(nn.Module):
             
             gene_tokens = gene_embed + gene_pos + value_emb
         else:
-            # all gene
+            # Original approach: use all genes
             gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1)
             gene_embed = self.gene_embedding(gene_ids)
             gene_pos = self.gene_pos_embedding(gene_ids)
@@ -142,9 +142,9 @@ class SpotFusionModule(nn.Module):
     """
     Fusion options:
     - 'concat': Simple concatenation + MLP
-    - 'attn': Cross-attention between img and st
-    - 'sim': Similarity-based fusion (cosine, product, diff)
-    - 'gate': Gated fusion with learnable weights
+    - 'attn'  : Cross-attention between image and ST features
+    - 'sim'   : Similarity-based fusion (cosine, product, difference)
+    - 'gate'  : Gated fusion with learnable weights
     """
     def __init__(
         self,
@@ -191,7 +191,7 @@ class SpotFusionModule(nn.Module):
             self.out_proj = nn.Linear(embed_dim, embed_dim)
 
         elif fusion_option == 'sim':
-            # 4D + 1 = img, st, product, abs_diff, cosine_sim
+            # 4D + 1 = img, st, product, abs_diff, cosine similarity
             self.fuse = nn.Sequential(
                 nn.Linear(embed_dim * 4 + 1, embed_dim * 2),
                 nn.GELU(),
@@ -219,10 +219,10 @@ class SpotFusionModule(nn.Module):
     def forward(self, img_feat, st_feat):
         """
         img_feat: (N, D)
-        st_feat: (N, D)
-        return: (N, D)
+        st_feat : (N, D)
+        return  : (N, D)
         """
-        # Pre-norm
+        # Pre-normalization
         img_feat = self.pre_norm_img(img_feat)
         st_feat = self.pre_norm_st(st_feat)
 
@@ -232,23 +232,23 @@ class SpotFusionModule(nn.Module):
             return self.fuse(x)  # (N, D)
 
         elif self.fusion_option == 'attn':
-            # Cross-attention: [img, st] as 2 tokens
+            # Cross-attention with [img, st] as two tokens
             tokens = torch.stack([img_feat, st_feat], dim=1)  # (N, 2, D)
             
             # Self-attention
             attn_out, _ = self.attn(tokens, tokens, tokens)  # (N, 2, D)
             tokens = self.norm1(tokens + attn_out)
             
-            # FFN
+            # Feed-forward network
             ffn_out = self.ffn(tokens)  # (N, 2, D)
             tokens = self.norm2(tokens + ffn_out)
             
-            # Pool (average)
+            # Pooling (average)
             pooled = tokens.mean(dim=1)  # (N, D)
             return self.out_proj(pooled)
 
         elif self.fusion_option == 'sim':
-            # Similarity-based features
+            # Similarity-based fusion features
             if self.use_l2norm_for_sim:
                 img_n = F.normalize(img_feat, p=2, dim=-1, eps=1e-8)
                 st_n = F.normalize(st_feat, p=2, dim=-1, eps=1e-8)
@@ -274,7 +274,7 @@ class SpotFusionModule(nn.Module):
             x = torch.cat([img_feat, st_feat], dim=-1)  # (N, 2D)
             weights = self.gate(x)  # (N, 2)
             
-            # Weighted sum
+            # Weighted sum of modalities
             fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
             return self.proj(fused)  # (N, D)
 
@@ -353,7 +353,7 @@ class MultiModalMILModel(nn.Module):
         
         Returns:
           logits: (num_classes,)  # Single WSI prediction
-          attn: (N_spots, 1)      # Attention weights
+          attn  : (N_spots, 1)    # Attention weights
         """
         # Spot-level encoding
         img_feat = self.img_encoder(images)      # (N, D)
