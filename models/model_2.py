@@ -370,17 +370,3 @@ class MultiModalMILModel(nn.Module):
         
         return logits, attn
 
-    def forward(self, images, expr, coords):
-        """
-        images: (N_spots, 3, 224, 224)
-        expr  : (N_spots, K)
-        coords: (N_spots, 2)
-        """
-        img_feat = self.img_encoder(images)
-        st_feat  = self.st_encoder(expr, coords)
-
-        spot_embeds = self.fusion(img_feat, st_feat)
-        wsi_embed, attn = self.mil_pooling(spot_embeds)
-
-        logits = self.classifier(wsi_embed.unsqueeze(0))
-        return logits.squeeze(0), attn
