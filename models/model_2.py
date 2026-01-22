@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-from performer_pytorch import Performer
+from models.performer_pytorch import Performer
 
 # =======================================================
 # 1. Image Encoder (Patch → Spot-level visual feature)
