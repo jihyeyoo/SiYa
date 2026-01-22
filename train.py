@@ -10,7 +10,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 
-from loader import CustomSample, create_wsi_dataloader
+from dataset.loader import CustomSample, create_wsi_dataloader
 from models.model_sanity import MultiModalMILModel
 
 # ===============================================
