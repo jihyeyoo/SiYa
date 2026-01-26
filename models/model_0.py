@@ -15,10 +15,10 @@ class ImageEncoder(nn.Module):
     def forward(self, x):
         return self.backbone(x)
 
-
 # -------------------------------------------------------
-# 2. Spatial Transcriptomics (ST) Encoder
+# 2. ST Encoder
 # -------------------------------------------------------
+# models/model_0.py
 class STEncoder(nn.Module):
     def __init__(
         self, 
@@ -31,8 +31,10 @@ class STEncoder(nn.Module):
     ):
         super().__init__()
         
+        self.top_k_genes = top_k_genes
+        
         if top_k_genes is not None:
-            print(f"⚠️  top_k_genes={top_k_genes} provided but not implemented in this encoder")
+            print(f"✓ Using top_k_genes={top_k_genes}")
         
         self.gene_embed = nn.Sequential(
             nn.Linear(num_genes, embed_dim),
@@ -56,12 +58,23 @@ class STEncoder(nn.Module):
         )
 
     def forward(self, expr: torch.Tensor, coord: torch.Tensor=None) -> torch.Tensor:
+        # Top-K 
+        if self.top_k_genes is not None:
+            top_k = min(self.top_k_genes, expr.shape[1])
+            
+            # Top-K index
+            _, top_indices = torch.topk(expr, k=top_k, dim=1)
+            
+            expr_masked = torch.zeros_like(expr)
+            expr_masked.scatter_(1, top_indices, expr.gather(1, top_indices))
+            
+            expr = expr_masked
+        
         x = self.gene_embed(expr)
         x = x.unsqueeze(1)
         x = self.transformer(x)
         x = x.squeeze(1)
         return self.proj(x)
-
 
 # -------------------------------------------------------
 # 3. Fusion Layer
@@ -70,9 +83,9 @@ class FusionLayer(nn.Module):
     """
     Fusion options (fused_dim=256):
     - 'concat'  : concat([img, st]) -> MLP -> fused (B, fused_dim)
-    - 'attn'    : treat [img, st] as 2 tokens -> self-attention -> pool -> fused (B, fused_dim)
+    - 'attn'    : treat [img, st] as 2 tokens -> self-attn -> pool -> fused (B, fused_dim)
     - 'sim'     : concat([img, st, img*st, |img-st|, cosine(img, st)]) -> MLP -> fused (B, fused_dim)
-    - 'gate'    : gated fusion
+    - 'gate'    : gate fusion
     """
     def __init__(
             self,
@@ -128,7 +141,7 @@ class FusionLayer(nn.Module):
                 nn.Dropout(dropout),
             )
         elif fusion_option == 'gate':
-            # Two-modality gating: [img, st]
+            # 2-modality gate: [img, st]
             self.gate = nn.Sequential(
                 nn.Linear(embed_dim * 2, embed_dim),
                 nn.ReLU(),
@@ -143,13 +156,13 @@ class FusionLayer(nn.Module):
 
     def forward(self, img_feat: torch.Tensor, st_feat: torch.Tensor) -> torch.Tensor:
 
-        # Basic input validation
+        # basic checks
         if img_feat.ndim != 2 or st_feat.ndim != 2:
             raise ValueError("img_feat and st_feat must be 2D tensors of shape (B, D)")
         if img_feat.shape != st_feat.shape:
             raise ValueError(f"Shape mismatch: {img_feat.shape} vs {st_feat.shape}")
 
-        # Pre-normalization to align feature distributions
+        # pre-norm to align distributions
         img_feat = self.pre_norm_img(img_feat)
         st_feat = self.pre_norm_st(st_feat)
 
@@ -158,7 +171,7 @@ class FusionLayer(nn.Module):
             return self.fuse(x)                         # (B, fused_dim)
 
         elif self.fusion_option == 'attn':
-            # Two tokens: [img_feat, st_feat]
+            # 2 tokens: [img_feat, st_feat]
             tokens = torch.stack([img_feat, st_feat], dim=1)    # (B, 2, D)
             attn_out, _ = self.attn(tokens, tokens, tokens)     # (B, 2, D)
             tokens = self.norm1(tokens + attn_out)
@@ -174,8 +187,7 @@ class FusionLayer(nn.Module):
             else:
                 img_n = img_feat
                 st_n = st_feat
-
-            sim = F.cosine_similarity(img_n, st_n, dim=1, eps=1e-8).unsqueeze(1)  # (B, 1)
+            sim = F.cosine_similarity(img_n, st_n, dim=1, eps=1e-8).unsqueeze(1)    # (B, 1)
             prod = img_n * st_n
             abs_diff = torch.abs(img_n - st_n)
 
@@ -183,15 +195,14 @@ class FusionLayer(nn.Module):
             return self.fuse(x)  # (B, fused_dim)
         
         elif self.fusion_option == 'gate':
-            # Concatenate both modalities
-            x = torch.cat([img_feat, st_feat], dim=1)  # (B, 2D)
-            weights = self.gate(x)                      # (B, 2)
+            # Concat all modality
+            x = torch.cat([img_feat,st_feat], dim=1)  # (B, 2D)
+            weights = self.gate(x)  # (B, 2)
             fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (B, D)
             return self.proj(fused)   # (B, fused_dim)
 
-
 # -------------------------------------------------------
-# 4. MIL Pooling (WSI-Level Aggregation)
+# 4. MIL Pooling (WSI-Level aggregation)
 # -------------------------------------------------------
 class MILAttentionPooling(nn.Module):
     def __init__(self, embed_dim: int = 256, hidden_dim: int=None, dropout: float=0.0):
@@ -209,13 +220,9 @@ class MILAttentionPooling(nn.Module):
             nn.Sigmoid()
         )
         self.attn_w = nn.Linear(hidden_dim, 1)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()    
 
     def forward(self, spot_embeds: torch.Tensor):
-        """
-        Modified to support batch processing,
-        while preserving original functionality
-        """
         # spot_embeds: (N, D) or (B, N, D)
         if spot_embeds.ndim == 2:
             H = spot_embeds.unsqueeze(0)  # (1, N, D)
@@ -236,12 +243,12 @@ class MILAttentionPooling(nn.Module):
         Z = torch.sum(alpha * H, dim=1)  # (B, D)
 
         if squeeze_back:
-            return Z.squeeze(0), alpha.squeeze(0)  # (D,), (N, 1)
+            return Z.squeeze(0), alpha.squeeze(0)  # (D,), (N,1)
         return Z, alpha     
 
 
 # --------------------------------------------------------
-# 5. Post-Encoder Projection Layer
+# 5. Layer after encoders
 # --------------------------------------------------------
 class LinearHead(nn.Module):
     def __init__(self, dim: int, use_ln: bool=True):
@@ -254,7 +261,7 @@ class LinearHead(nn.Module):
 
 
 # -------------------------------------------------------
-# 6. Full Multi-Modal MIL Model
+# 6. Full Multi-Modal Model
 # -------------------------------------------------------
 class MultiModalMILModel(nn.Module):
     def __init__(
@@ -263,9 +270,9 @@ class MultiModalMILModel(nn.Module):
         num_classes: int=2,
         embed_dim: int=256,
         fusion_option: str='concat',
-        top_k_genes: int=None,             
-        dropout: float=0.3,                
-        freeze_image_encoder: bool=True,   
+        top_k_genes: int=None,       
+        dropout: float=0.3,            
+        freeze_image_encoder: bool=True, 
         img_backbone: str='resnet18',
         img_pretrained: bool=True,
         mil_hidden_dim: int=None,
@@ -275,9 +282,7 @@ class MultiModalMILModel(nn.Module):
     ):
         super().__init__()
         
-        if top_k_genes is not None:
-            print(f"⚠️  top_k_genes={top_k_genes} provided but not used")
-        
+
         self.img_encoder = ImageEncoder(
             embed_dim=embed_dim, 
             backbone=img_backbone, 
@@ -289,13 +294,12 @@ class MultiModalMILModel(nn.Module):
             nhead=4, 
             num_layers=2, 
             dropout=0.1,
-            top_k_genes=top_k_genes
+            top_k_genes=top_k_genes  
         )
         
         self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)
         self.st_head = nn.Identity()
 
-        # Conditional freezing of image encoder
         if freeze_image_encoder:
             self.freeze_encoders()
 
