@@ -11,7 +11,7 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 
 from dataset.loader import CustomSample, create_wsi_dataloader
-from models.model_sanity import MultiModalMILModel
+from models.model_2 import MultiModalMILModel
 
 # ===============================================
 # YAML Config Loader 
@@ -65,7 +65,7 @@ def set_seed(seed):
 # Data Split
 # ===============================================
 def prepare_data_splits(root_dir, seed=42):
-    st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
+    st_dir = os.path.join(root_dir, "global_hvg_unified")
     patch_dir = os.path.join(root_dir, "patches")
 
     st_files = {f.replace('.h5ad', '') for f in os.listdir(st_dir) if f.endswith('.h5ad')}
@@ -78,8 +78,14 @@ def prepare_data_splits(root_dir, seed=42):
     for sid in valid_ids:
         try:
             sample = CustomSample(root_dir, sid)
-            samples.append(sample)
-            labels.append(sample.label)
+            
+            # Binary classification만 사용
+            if sample.label in [0, 1]:
+                samples.append(sample)
+                labels.append(sample.label)
+            else:
+                print(f"⚠️  Skipping {sid} (label={sample.label})")
+                
         except Exception as e:
             print(f"Failed to load {sid}: {e}")
 
@@ -275,7 +281,7 @@ def main():
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), "best_model.pt")
+            torch.save(model.state_dict(), "best_model_attn.pt")
 
     print("\n TRAINING COMPLETE!!")
 
