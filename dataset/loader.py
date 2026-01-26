@@ -11,7 +11,7 @@ import gc
 # -------------------------------------------------------
 def load_global_gene_order(root_dir):
     """Load global HVG gene list to ensure consistent gene ordering"""
-    hvg_path = os.path.join(root_dir, 'global_hvg_genes.txt')
+    hvg_path = os.path.join(root_dir, 'global_hvg_genes_unified.txt')
     
     if os.path.exists(hvg_path):
         with open(hvg_path, 'r') as f:
@@ -19,7 +19,7 @@ def load_global_gene_order(root_dir):
         print(f"✓ Loaded global gene order: {len(global_genes)} genes")
         return global_genes
     else:
-        print("global_hvg_genes.txt not found, will infer from first sample")
+        print("⚠️  global_hvg_genes.txt not found, will infer from first sample")
         return None
 
 
@@ -29,7 +29,7 @@ def load_global_gene_order(root_dir):
 class CustomSample:
     def __init__(self, root, sample_id):
         self.sample_id = sample_id
-        self.st_path = os.path.join(root, "st_preprocessed_global_hvg", f"{sample_id}.h5ad")
+        self.st_path = os.path.join(root, "global_hvg_unified", f"{sample_id}.h5ad")
         self.patch_path = os.path.join(root, "patches", f"{sample_id}.h5")
         
         if not os.path.exists(self.st_path):
@@ -198,7 +198,7 @@ class WSIDataset(Dataset):
             }
             
         except Exception as e:
-            print(f"Error loading {sample.sample_id}: {e}")
+            print(f"⚠️ Error loading {sample.sample_id}: {e}")
             import traceback
             print(traceback.format_exc())
             raise
