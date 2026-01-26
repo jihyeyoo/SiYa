@@ -26,7 +26,7 @@ class ImageEncoder(nn.Module):
 # =======================================================
 class SpatialSTEncoder(nn.Module):
     """
-    scBERT-style encoder with an explicit spatial token
+    scBERT-style encoder with explicit spatial token
 
     Input:
       - expr   : (N_spots, K)   [already HVG-filtered]
@@ -82,7 +82,7 @@ class SpatialSTEncoder(nn.Module):
             ff_dropout=0.1,
         )
 
-        # Spatial-query pooling projections
+        # Spatial-query pooling
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
@@ -96,9 +96,9 @@ class SpatialSTEncoder(nn.Module):
         N, K = expr.shape
         device = expr.device
 
-        # Top-K gene selection (memory-efficient)
+        # ✅ Top-K gene selection (메모리 절약)
         if self.top_k_genes and self.top_k_genes < K:
-            # Select top-K genes with highest expression per spot
+            # 각 spot에서 expression 값이 높은 상위 K개만 선택
             topk_values, topk_indices = torch.topk(expr, k=self.top_k_genes, dim=1)
             
             gene_embed = self.gene_embedding(topk_indices)  # (N, top_k, D)
@@ -107,7 +107,7 @@ class SpatialSTEncoder(nn.Module):
             
             gene_tokens = gene_embed + gene_pos + value_emb
         else:
-            # Original approach: use all genes
+            # 원래 방식: 모든 gene 사용
             gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1)
             gene_embed = self.gene_embedding(gene_ids)
             gene_pos = self.gene_pos_embedding(gene_ids)
@@ -142,9 +142,9 @@ class SpotFusionModule(nn.Module):
     """
     Fusion options:
     - 'concat': Simple concatenation + MLP
-    - 'attn'  : Cross-attention between image and ST features
-    - 'sim'   : Similarity-based fusion (cosine, product, difference)
-    - 'gate'  : Gated fusion with learnable weights
+    - 'attn': Cross-attention between img and st
+    - 'sim': Similarity-based fusion (cosine, product, diff)
+    - 'gate': Gated fusion with learnable weights
     """
     def __init__(
         self,
@@ -191,7 +191,7 @@ class SpotFusionModule(nn.Module):
             self.out_proj = nn.Linear(embed_dim, embed_dim)
 
         elif fusion_option == 'sim':
-            # 4D + 1 = img, st, product, abs_diff, cosine similarity
+            # 4D + 1 = img, st, product, abs_diff, cosine_sim
             self.fuse = nn.Sequential(
                 nn.Linear(embed_dim * 4 + 1, embed_dim * 2),
                 nn.GELU(),
@@ -219,10 +219,10 @@ class SpotFusionModule(nn.Module):
     def forward(self, img_feat, st_feat):
         """
         img_feat: (N, D)
-        st_feat : (N, D)
-        return  : (N, D)
+        st_feat: (N, D)
+        return: (N, D)
         """
-        # Pre-normalization
+        # Pre-norm
         img_feat = self.pre_norm_img(img_feat)
         st_feat = self.pre_norm_st(st_feat)
 
@@ -232,23 +232,23 @@ class SpotFusionModule(nn.Module):
             return self.fuse(x)  # (N, D)
 
         elif self.fusion_option == 'attn':
-            # Cross-attention with [img, st] as two tokens
+            # Cross-attention: [img, st] as 2 tokens
             tokens = torch.stack([img_feat, st_feat], dim=1)  # (N, 2, D)
             
             # Self-attention
             attn_out, _ = self.attn(tokens, tokens, tokens)  # (N, 2, D)
             tokens = self.norm1(tokens + attn_out)
             
-            # Feed-forward network
+            # FFN
             ffn_out = self.ffn(tokens)  # (N, 2, D)
             tokens = self.norm2(tokens + ffn_out)
             
-            # Pooling (average)
+            # Pool (average)
             pooled = tokens.mean(dim=1)  # (N, D)
             return self.out_proj(pooled)
 
         elif self.fusion_option == 'sim':
-            # Similarity-based fusion features
+            # Similarity-based features
             if self.use_l2norm_for_sim:
                 img_n = F.normalize(img_feat, p=2, dim=-1, eps=1e-8)
                 st_n = F.normalize(st_feat, p=2, dim=-1, eps=1e-8)
@@ -274,7 +274,7 @@ class SpotFusionModule(nn.Module):
             x = torch.cat([img_feat, st_feat], dim=-1)  # (N, 2D)
             weights = self.gate(x)  # (N, 2)
             
-            # Weighted sum of modalities
+            # Weighted sum
             fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
             return self.proj(fused)  # (N, D)
 
@@ -306,7 +306,22 @@ class MILAttentionPooling(nn.Module):
 
 
 # =======================================================
-# 5. Full Multi-Modal MIL Model
+# 5. Linear Head (Image Encoder 뒤에 붙일 FC layer)
+# =======================================================
+class LinearHead(nn.Module):
+    def __init__(self, dim: int, use_ln: bool=True):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim) if use_ln else nn.Identity()
+        self.fc = nn.Linear(dim, dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.ln(x))
+    
+# =======================================================
+# 6. Full Multi-Modal MIL Model
+# =======================================================
+# =======================================================
+# 6. Full Multi-Modal MIL Model (Freeze 지원)
 # =======================================================
 class MultiModalMILModel(nn.Module):
     def __init__(
@@ -315,35 +330,72 @@ class MultiModalMILModel(nn.Module):
         num_classes=2,
         embed_dim=256,
         fusion_option='concat',
-        dropout=0.3,  
         top_k_genes=None,
+        dropout=0.3,
+        freeze_image_encoder=True,  # ✅ 추가
+        mil_hidden_dim=128,
+        mil_dropout=0.0,
+        fusion_dropout=0.2,
+        head_use_ln=True,
     ):
         super().__init__()
         
         self.fusion_option = fusion_option
+        self.freeze_image_encoder = freeze_image_encoder
 
+        # ✅ Image Encoder + Head (freeze 가능)
         self.img_encoder = ImageEncoder(embed_dim)
-        self.st_encoder  = SpatialSTEncoder(
+        self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)  # ✅ 추가
+        
+        # ST Encoder (항상 학습)
+        self.st_encoder = SpatialSTEncoder(
             num_genes=num_genes,
             embed_dim=embed_dim,
             top_k_genes=top_k_genes,
         )
+        self.st_head = nn.Identity()
 
-        self.fusion      = SpotFusionModule(
+        # ✅ Freeze 적용
+        if freeze_image_encoder:
+            self.freeze_encoders()
+
+        # Fusion
+        self.fusion = SpotFusionModule(
             embed_dim=embed_dim,
             fusion_option=fusion_option,
+            dropout=fusion_dropout,
         )
-        self.mil_pooling = MILAttentionPooling(embed_dim)
+        
+        # MIL Pooling
+        self.mil_pooling = MILAttentionPooling(
+            embed_dim=embed_dim,
+            hidden_dim=mil_hidden_dim,
+        )
 
+        # Classifier
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim, 128),
-            nn.LayerNorm(128),  
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(128, num_classes)
         )
         
-        print(f"✓ Model initialized with fusion_option='{fusion_option}'")
+        print(f"✓ Model 1 initialized with fusion_option='{fusion_option}'")
+        if freeze_image_encoder:
+            print(f"✓ Image Encoder frozen (only img_head trainable)")
+
+    def freeze_encoders(self):
+        """ResNet backbone만 freeze"""
+        for param in self.img_encoder.parameters():
+            param.requires_grad = False
+        self.img_encoder.eval()
+    
+    def train(self, mode: bool=True):
+        """Training 모드에서도 Image Encoder는 eval 유지"""
+        super().train(mode)
+        if self.freeze_image_encoder:
+            self.img_encoder.eval()
 
     def forward(self, images, expr, coords):
         """
@@ -352,21 +404,29 @@ class MultiModalMILModel(nn.Module):
         coords: (N_spots, 2)
         
         Returns:
-          logits: (num_classes,)  # Single WSI prediction
-          attn  : (N_spots, 1)    # Attention weights
+          logits: (num_classes,)
+          attn: (N_spots, 1)
         """
-        # Spot-level encoding
-        img_feat = self.img_encoder(images)      # (N, D)
-        st_feat  = self.st_encoder(expr, coords) # (N, D)
-
-        # Spot-level fusion
-        spot_embeds = self.fusion(img_feat, st_feat)  # (N, D)
+        # Image encoding (frozen) + head (trainable)
+        if self.freeze_image_encoder:
+            with torch.no_grad():
+                img_feat = self.img_encoder(images)
+        else:
+            img_feat = self.img_encoder(images)
         
-        # WSI-level aggregation
-        wsi_embed, attn = self.mil_pooling(spot_embeds)  # (D,), (N, 1)
+        img_feat = self.img_head(img_feat)  # FC layer (trainable)
+        
+        # ST encoding (trainable)
+        st_feat = self.st_encoder(expr, coords)
+        st_feat = self.st_head(st_feat)
+
+        # Fusion
+        spot_embeds = self.fusion(img_feat, st_feat)
+        
+        # MIL Pooling
+        wsi_embed, attn = self.mil_pooling(spot_embeds)
 
         # Classification
-        logits = self.classifier(wsi_embed)  # (num_classes,)
+        logits = self.classifier(wsi_embed)
         
         return logits, attn
-
