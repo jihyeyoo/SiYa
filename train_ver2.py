@@ -20,7 +20,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 from dataset.loader import CustomSample, create_wsi_dataloader
-from models.model_ablation import MultiModalMILModel
+from models.model_2 import MultiModalMILModel
 
 
 # ===============================================
