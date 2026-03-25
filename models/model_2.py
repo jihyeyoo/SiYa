@@ -4,6 +4,13 @@ import torch.nn.functional as F
 import torchvision.models as models
 from models.performer_pytorch import Performer
 
+"""
+An ablation-support ver. of model.py:
+- ST-only
+- Image-only
+- Multimodal(ST+Image)
+"""
+
 # =======================================================
 # 1. Image Encoder (Patch → Spot-level visual feature)
 # =======================================================
@@ -19,7 +26,6 @@ class ImageEncoder(nn.Module):
         return: (N_spots, embed_dim)
         """
         return self.backbone(x)
-
 
 # =======================================================
 # 2. Spatial ST Encoder (HVG-only, scBERT-style)
@@ -88,27 +94,34 @@ class SpatialSTEncoder(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, expr, coords):
+    def forward(self, expr, coords, return_gene_attn=False):
         """
         expr   : (N, K)
         coords : (N, 2)
+
+        if return_gene_attn:
+          returns:
+            pooled: (N, D)
+            gene_attn: (N, G_used)          # G_used = top_k_genes or K
+            gene_indices: (N, G_used) (long) # global gene ids
+        else:
+          returns:
+            pooled: (N, D)
         """
         N, K = expr.shape
         device = expr.device
 
-        # ✅ Top-K gene selection (메모리 절약)
+        # Top-K gene selection
         if self.top_k_genes and self.top_k_genes < K:
-            # 각 spot에서 expression 값이 높은 상위 K개만 선택
             topk_values, topk_indices = torch.topk(expr, k=self.top_k_genes, dim=1)
-            
-            gene_embed = self.gene_embedding(topk_indices)  # (N, top_k, D)
-            gene_pos = self.gene_pos_embedding(topk_indices)
+            gene_indices = topk_indices.long()  # global gene ids
+
+            gene_embed = self.gene_embedding(gene_indices)  # (N, top_k, D)
+            gene_pos = self.gene_pos_embedding(gene_indices)
             value_emb = self.value_embedding(topk_values.unsqueeze(-1))
-            
             gene_tokens = gene_embed + gene_pos + value_emb
         else:
-            # 원래 방식: 모든 gene 사용
-            gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1)
+            gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1).long()
             gene_embed = self.gene_embedding(gene_ids)
             gene_pos = self.gene_pos_embedding(gene_ids)
             value_emb = self.value_embedding(expr.unsqueeze(-1))
@@ -132,8 +145,13 @@ class SpatialSTEncoder(nn.Module):
         )
 
         pooled = torch.matmul(attn, v).squeeze(1)
-        return self.out_proj(pooled)
+        pooled = self.out_proj(pooled)
 
+        if return_gene_attn:
+            gene_attn = attn.squeeze(1)
+            return pooled, gene_attn, gene_indices
+        else:
+            return pooled
 
 # =======================================================
 # 3. Spot Fusion Module (4 options: concat, attn, sim, gate)
@@ -278,7 +296,6 @@ class SpotFusionModule(nn.Module):
             fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
             return self.proj(fused)  # (N, D)
 
-
 # =======================================================
 # 4. MIL Attention Pooling (Spot → WSI)
 # =======================================================
@@ -304,9 +321,8 @@ class MILAttentionPooling(nn.Module):
         wsi_embed = torch.sum(weights * spot_embeds, dim=0)
         return wsi_embed, weights
 
-
 # =======================================================
-# 5. Linear Head (Image Encoder 뒤에 붙일 FC layer)
+# 5. Linear Head
 # =======================================================
 class LinearHead(nn.Module):
     def __init__(self, dim: int, use_ln: bool=True):
@@ -316,12 +332,9 @@ class LinearHead(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(self.ln(x))
-    
+      
 # =======================================================
 # 6. Full Multi-Modal MIL Model
-# =======================================================
-# =======================================================
-# 6. Full Multi-Modal MIL Model (Freeze 지원)
 # =======================================================
 class MultiModalMILModel(nn.Module):
     def __init__(
@@ -332,40 +345,56 @@ class MultiModalMILModel(nn.Module):
         fusion_option='concat',
         top_k_genes=None,
         dropout=0.3,
-        freeze_image_encoder=True,  # ✅ 추가
+        freeze_image_encoder=True,
         mil_hidden_dim=128,
         mil_dropout=0.0,
         fusion_dropout=0.2,
         head_use_ln=True,
+
+        # ablation용
+        use_image =True,
+        use_st=True
     ):
         super().__init__()
+
+        assert use_image or use_st, "At least one modality must be used!!"
         
+        self.use_image = use_image
+        self.use_st = use_st
         self.fusion_option = fusion_option
         self.freeze_image_encoder = freeze_image_encoder
 
-        # ✅ Image Encoder + Head (freeze 가능)
-        self.img_encoder = ImageEncoder(embed_dim)
-        self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)  # ✅ 추가
-        
-        # ST Encoder (항상 학습)
-        self.st_encoder = SpatialSTEncoder(
-            num_genes=num_genes,
-            embed_dim=embed_dim,
-            top_k_genes=top_k_genes,
-        )
+        # Ablation: conditional encoder
+        if self.use_image:
+            self.img_encoder = ImageEncoder(embed_dim)
+            self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)
+        else:
+            self.img_encoder = None
+            self.img_head = None
+
+        if self.use_st:
+            self.st_encoder = SpatialSTEncoder(
+                num_genes=num_genes,
+                embed_dim=embed_dim,
+                top_k_genes=top_k_genes,
+            )
+        else:
+            self.st_encoder = None
         self.st_head = nn.Identity()
 
-        # ✅ Freeze 적용
-        if freeze_image_encoder:
+        # Freeze
+        if self.use_image and freeze_image_encoder:
             self.freeze_encoders()
+            
+        if self.use_image and self.use_st:
+            self.fusion = SpotFusionModule(
+                embed_dim=embed_dim,
+                fusion_option=fusion_option,
+                dropout=fusion_dropout,
+            )
+        else:
+            self.fusion = None
 
-        # Fusion
-        self.fusion = SpotFusionModule(
-            embed_dim=embed_dim,
-            fusion_option=fusion_option,
-            dropout=fusion_dropout,
-        )
-        
         # MIL Pooling
         self.mil_pooling = MILAttentionPooling(
             embed_dim=embed_dim,
@@ -387,17 +416,19 @@ class MultiModalMILModel(nn.Module):
 
     def freeze_encoders(self):
         """ResNet backbone만 freeze"""
+        if self.img_encoder is None:    # Ablation
+            return
         for param in self.img_encoder.parameters():
             param.requires_grad = False
         self.img_encoder.eval()
     
     def train(self, mode: bool=True):
-        """Training 모드에서도 Image Encoder는 eval 유지"""
+        """Keep image encoder as eval during training"""
         super().train(mode)
-        if self.freeze_image_encoder:
+        if self.use_image and self.freeze_image_encoder:
             self.img_encoder.eval()
 
-    def forward(self, images, expr, coords):
+    def forward(self, images, expr, coords, return_gene_attn=True, return_spot_embeds=True):
         """
         images: (N_spots, 3, 224, 224)
         expr  : (N_spots, K)
@@ -407,26 +438,50 @@ class MultiModalMILModel(nn.Module):
           logits: (num_classes,)
           attn: (N_spots, 1)
         """
-        # Image encoding (frozen) + head (trainable)
-        if self.freeze_image_encoder:
-            with torch.no_grad():
-                img_feat = self.img_encoder(images)
-        else:
-            img_feat = self.img_encoder(images)
-        
-        img_feat = self.img_head(img_feat)  # FC layer (trainable)
-        
-        # ST encoding (trainable)
-        st_feat = self.st_encoder(expr, coords)
-        st_feat = self.st_head(st_feat)
+        spot_embeds = None
 
-        # Fusion
-        spot_embeds = self.fusion(img_feat, st_feat)
+        gene_attn = None
+        gene_indices = None
         
+        # Ablation: conditional encoding
+        if self.use_image:  # img branch
+            if self.freeze_image_encoder:
+                with torch.no_grad():
+                    img_feat = self.img_encoder(images)
+            else:
+                img_feat = self.img_encoder(images)
+            img_feat = self.img_head(img_feat)  # FC layer (trainable)
+
+        if self.use_st:     # st branch
+            if return_gene_attn:
+                st_feat, gene_attn, gene_indices = self.st_encoder(expr, coords, return_gene_attn=True)
+            else:
+                st_feat = self.st_encoder(expr, coords, return_gene_attn=False)
+                gene_attn, gene_indices = None, None
+        
+        # Ablation: process spot embedding per modality
+        if self.use_image and self.use_st:  # Both modalities: Fusion
+            spot_embeds = self.fusion(img_feat, st_feat)
+        elif self.use_image:    # Image only
+            spot_embeds = img_feat
+        elif self.use_st:       # ST only
+            spot_embeds = st_feat
+
         # MIL Pooling
-        wsi_embed, attn = self.mil_pooling(spot_embeds)
+        wsi_embed, mil_attn = self.mil_pooling(spot_embeds)
+        mil_attn = mil_attn.squeeze(-1)  # (N_spots,)
 
         # Classification
         logits = self.classifier(wsi_embed)
         
-        return logits, attn
+        out = {
+            "logits": logits,
+            "mil_attn": mil_attn,
+            "gene_attn": gene_attn,
+            "gene_indices": gene_indices,
+        }
+        if return_spot_embeds:
+            out["spot_embeds"] = spot_embeds
+
+        return out
+    
