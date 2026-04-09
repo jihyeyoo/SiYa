@@ -154,15 +154,20 @@ class SpatialSTEncoder(nn.Module):
             return pooled
 
 # =======================================================
-# 3. Spot Fusion Module (4 options: concat, attn, sim, gate)
+# 3. Spot Fusion Module (3 options: concat, attn, spatial_attn)
 # =======================================================
 class SpotFusionModule(nn.Module):
     """
-    Fusion options:
-    - 'concat': Simple concatenation + MLP
-    - 'attn': Cross-attention between img and st
-    - 'sim': Similarity-based fusion (cosine, product, diff)
-    - 'gate': Gated fusion with learnable weights
+    Fusion options (img_feat, st_feat → fused):
+
+    - 'concat'      : concat([img, st]) → MLP → fused
+
+    - 'attn'        : self-attention over [img, st] as 2 tokens → mean pool → fused
+
+    - 'spatial_attn': st_feat (spatial+gene context) as Q, img_feat as K/V.
+                      Since st_encoder already encodes both coordinates and gene
+                      expression, st_feat acts as a position-aware query that
+                      selectively attends to visual features.
     """
     def __init__(
         self,
@@ -170,17 +175,14 @@ class SpotFusionModule(nn.Module):
         fusion_option='concat',
         attn_heads=4,
         dropout=0.2,
-        use_l2norm_for_sim=True
     ):
         super().__init__()
-        self.embed_dim = embed_dim
+        self.embed_dim    = embed_dim
         self.fusion_option = fusion_option
-        self.dropout = dropout
-        self.use_l2norm_for_sim = use_l2norm_for_sim
-        
+
         # Pre-normalization
         self.pre_norm_img = nn.LayerNorm(embed_dim)
-        self.pre_norm_st = nn.LayerNorm(embed_dim)
+        self.pre_norm_st  = nn.LayerNorm(embed_dim)
 
         if fusion_option == 'concat':
             self.fuse = nn.Sequential(
@@ -197,104 +199,70 @@ class SpotFusionModule(nn.Module):
                 dropout=dropout,
                 batch_first=True,
             )
-            self.norm1 = nn.LayerNorm(embed_dim)
-            self.ffn = nn.Sequential(
+            self.norm1    = nn.LayerNorm(embed_dim)
+            self.ffn      = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim * 4),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(embed_dim * 4, embed_dim),
                 nn.Dropout(dropout),
             )
-            self.norm2 = nn.LayerNorm(embed_dim)
+            self.norm2    = nn.LayerNorm(embed_dim)
             self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-        elif fusion_option == 'sim':
-            # 4D + 1 = img, st, product, abs_diff, cosine_sim
-            self.fuse = nn.Sequential(
-                nn.Linear(embed_dim * 4 + 1, embed_dim * 2),
+        elif fusion_option == 'spatial_attn':
+            # Cross-attention: Q=st_feat (spatial+gene), K/V=img_feat
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=attn_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.norm1    = nn.LayerNorm(embed_dim)
+            self.ffn      = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4),
                 nn.GELU(),
                 nn.Dropout(dropout),
-                nn.Linear(embed_dim * 2, embed_dim),
-                nn.LayerNorm(embed_dim),
-                nn.GELU(),
+                nn.Linear(embed_dim * 4, embed_dim),
                 nn.Dropout(dropout),
             )
+            self.norm2    = nn.LayerNorm(embed_dim)
+            self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-        elif fusion_option == 'gate':
-            # Gated fusion
-            self.gate = nn.Sequential(
-                nn.Linear(embed_dim * 2, embed_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(embed_dim, 2),
-                nn.Softmax(dim=-1),
-            )
-            self.proj = nn.Linear(embed_dim, embed_dim)
-        
         else:
-            raise ValueError(f"Unknown fusion_option: {fusion_option}")
+            raise ValueError(
+                f"Unknown fusion_option: '{fusion_option}'. "
+                f"Choose from: 'concat', 'attn', 'spatial_attn'"
+            )
 
     def forward(self, img_feat, st_feat):
         """
-        img_feat: (N, D)
-        st_feat: (N, D)
-        return: (N, D)
+        img_feat : (N, D)
+        st_feat  : (N, D)  — encodes both gene expression + spatial coords
+        return   : (N, D)
         """
-        # Pre-norm
         img_feat = self.pre_norm_img(img_feat)
-        st_feat = self.pre_norm_st(st_feat)
+        st_feat  = self.pre_norm_st(st_feat)
 
         if self.fusion_option == 'concat':
-            # Simple concatenation
-            x = torch.cat([img_feat, st_feat], dim=-1)  # (N, 2D)
-            return self.fuse(x)  # (N, D)
+            return self.fuse(torch.cat([img_feat, st_feat], dim=-1))
 
         elif self.fusion_option == 'attn':
-            # Cross-attention: [img, st] as 2 tokens
-            tokens = torch.stack([img_feat, st_feat], dim=1)  # (N, 2, D)
-            
-            # Self-attention
-            attn_out, _ = self.attn(tokens, tokens, tokens)  # (N, 2, D)
-            tokens = self.norm1(tokens + attn_out)
-            
-            # FFN
-            ffn_out = self.ffn(tokens)  # (N, 2, D)
-            tokens = self.norm2(tokens + ffn_out)
-            
-            # Pool (average)
-            pooled = tokens.mean(dim=1)  # (N, D)
-            return self.out_proj(pooled)
+            tokens           = torch.stack([img_feat, st_feat], dim=1)  # (N, 2, D)
+            attn_out, _      = self.attn(tokens, tokens, tokens)
+            tokens           = self.norm1(tokens + attn_out)
+            tokens           = self.norm2(tokens + self.ffn(tokens))
+            return self.out_proj(tokens.mean(dim=1))
 
-        elif self.fusion_option == 'sim':
-            # Similarity-based features
-            if self.use_l2norm_for_sim:
-                img_n = F.normalize(img_feat, p=2, dim=-1, eps=1e-8)
-                st_n = F.normalize(st_feat, p=2, dim=-1, eps=1e-8)
-            else:
-                img_n = img_feat
-                st_n = st_feat
-            
-            # Cosine similarity
-            sim = F.cosine_similarity(img_n, st_n, dim=-1, eps=1e-8).unsqueeze(-1)  # (N, 1)
-            
-            # Element-wise product
-            prod = img_n * st_n  # (N, D)
-            
-            # Absolute difference
-            abs_diff = torch.abs(img_n - st_n)  # (N, D)
-            
-            # Concatenate all features
-            x = torch.cat([img_n, st_n, prod, abs_diff, sim], dim=-1)  # (N, 4D+1)
-            return self.fuse(x)  # (N, D)
-
-        elif self.fusion_option == 'gate':
-            # Gated fusion
-            x = torch.cat([img_feat, st_feat], dim=-1)  # (N, 2D)
-            weights = self.gate(x)  # (N, 2)
-            
-            # Weighted sum
-            fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
-            return self.proj(fused)  # (N, D)
+        elif self.fusion_option == 'spatial_attn':
+            # Q: spatial+gene context  (N, 1, D)
+            # K/V: image features      (N, 1, D)
+            q              = st_feat.unsqueeze(1)
+            kv             = img_feat.unsqueeze(1)
+            attn_out, _    = self.cross_attn(q, kv, kv)         # (N, 1, D)
+            out            = self.norm1(attn_out.squeeze(1) + st_feat)  # residual
+            out            = self.norm2(out + self.ffn(out.unsqueeze(1)).squeeze(1))
+            return self.out_proj(out)
 
 # =======================================================
 # 4. MIL Attention Pooling (Spot → WSI)
