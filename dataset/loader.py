@@ -14,46 +14,23 @@ import gc
 
 class CustomSample:
 
-    def __init__(self, root, sample_id, metadata_dir=None):
-
-        self.sample_id = sample_id
-        self.st_path = os.path.join(root, "st", f"{sample_id}.h5ad")
-        self.patch_path = os.path.join(root, "patches", f"{sample_id}.h5")
+    def __init__(self, sample_id, st_dir, patch_dir, label):
+        """
+        Args:
+            sample_id : slide ID (e.g. 'GSE144239_GSM4284316')
+            st_dir    : directory containing {sample_id}.h5ad  (preprocessed ST)
+            patch_dir : directory containing {sample_id}.h5    (extracted patches)
+            label     : int, 0=normal / 1=cancer
+        """
+        self.sample_id  = sample_id
+        self.st_path    = os.path.join(st_dir,    f"{sample_id}.h5ad")
+        self.patch_path = os.path.join(patch_dir, f"{sample_id}.h5")
+        self.label      = label
 
         if not os.path.exists(self.st_path):
-            raise FileNotFoundError(f"{self.st_path} not found.")
-
+            raise FileNotFoundError(f"ST file not found: {self.st_path}")
         if not os.path.exists(self.patch_path):
-            raise FileNotFoundError(f"{self.patch_path} not found.")
-
-        # Load label from metadata JSON
-        self.label = self._load_label_from_metadata(metadata_dir)
-
-    def _load_label_from_metadata(self, metadata_dir):
-        """Load label from metadata JSON"""
-
-        if metadata_dir is None:
-            metadata_dir = "./hest_data/metadata"
-
-        meta_path = os.path.join(metadata_dir, f"{self.sample_id}.json")
-
-        if not os.path.exists(meta_path):
-            raise FileNotFoundError(f"Metadata not found: {meta_path}")
-
-        import json
-        with open(meta_path) as f:
-            meta = json.load(f)
-
-        # Label mapping
-        LABEL_MAP = {'Healthy': 0, 'Cancer': 1, 'Tumor': 1}
-
-        label_str = meta.get("disease_state", -1)
-        label_num = LABEL_MAP.get(label_str, -1)
-
-        if label_num == -1:
-            raise ValueError(f"Invalid label for {self.sample_id}: {label_str}")
-
-        return label_num
+            raise FileNotFoundError(f"Patch file not found: {self.patch_path}")
 
 
 # -------------------------------------------------------
@@ -223,3 +200,4 @@ def create_wsi_dataloader(
     )
 
     return loader
+    
