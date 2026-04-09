@@ -156,16 +156,16 @@ class STEncoder(nn.Module):
 class FusionLayer(nn.Module):
 
     """
-    Fusion options (fused_dim=256):
+    Fusion options:
 
-    - 'concat'  : concat([img, sc, st]) -> MLP -> fused (B, fused_dim)
+    - 'concat'       : concat([img, sc, st]) -> MLP -> fused (B, fused_dim)
 
-    - 'attn'    : treat [img, sc, st] as 3 tokens -> self-attn -> pool -> fused (B, fused_dim)
+    - 'attn'         : treat [img, sc, st] as 3 tokens -> self-attn -> mean pool -> fused (B, fused_dim)
 
-    - 'sim'    : concat([img, sc, st, img*sc, img*st, sc*st, |img-sc|, |img-st|, |sc-st|, cosine(img,sc), cosine(img,st), cosine(sc,st)])
-                -> MLP -> fused
-
-    - 'gate'    : gate ([img, sc, st]) -> MLP -> fused (B, fused_dim)
+    - 'spatial_attn' : st_feat (coordinate embedding) as Q, [img_feat, sc_feat] as K/V
+                       → cross-attention → residual + proj
+                       Rationale: spatial position guides how much to weight
+                       image appearance vs. gene expression per spot.
     """
 
     def __init__(
@@ -175,7 +175,6 @@ class FusionLayer(nn.Module):
             fused_dim: int = 128,
             attn_heads: int = 4,
             dropout: float = 0.2,
-            use_l2norm_for_sim: bool = True
     ):
 
         super().__init__()
@@ -183,13 +182,11 @@ class FusionLayer(nn.Module):
         self.embed_dim = embed_dim
         self.fusion_option = fusion_option
         self.fused_dim = fused_dim
-        self.dropout = dropout
-        self.use_l2norm_for_sim = use_l2norm_for_sim
 
         # pre-norm for modality feature alignment
         self.pre_norm_img = nn.LayerNorm(embed_dim)
-        self.pre_norm_sc = nn.LayerNorm(embed_dim)
-        self.pre_norm_st = nn.LayerNorm(embed_dim)
+        self.pre_norm_sc  = nn.LayerNorm(embed_dim)
+        self.pre_norm_st  = nn.LayerNorm(embed_dim)
 
         if fusion_option == 'concat':
 
@@ -208,9 +205,7 @@ class FusionLayer(nn.Module):
                 dropout=dropout,
                 batch_first=True
             )
-
             self.norm1 = nn.LayerNorm(embed_dim)
-
             self.ffn = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim * 4),
                 nn.GELU(),
@@ -218,64 +213,49 @@ class FusionLayer(nn.Module):
                 nn.Linear(embed_dim * 4, embed_dim),
                 nn.Dropout(dropout)
             )
-
-            self.norm2 = nn.LayerNorm(embed_dim)
-
+            self.norm2    = nn.LayerNorm(embed_dim)
             self.out_proj = nn.Linear(embed_dim, fused_dim)
 
-        elif fusion_option == 'sim':
+        elif fusion_option == 'spatial_attn':
 
-            self.sim_fusion = nn.Sequential(
-                nn.Linear(embed_dim * 9 + 3, embed_dim * 2),
-                nn.LayerNorm(embed_dim * 2),
-                nn.GELU(),
-                nn.Dropout(0.4),
-                nn.Linear(embed_dim * 2, embed_dim),
-                nn.LayerNorm(embed_dim),
-                nn.GELU(),
-                nn.Dropout(0.3),
+            # Cross-attention: st_feat (position) queries over img + sc features
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=attn_heads,
+                dropout=dropout,
+                batch_first=True
             )
-
-        elif fusion_option == 'gate':
-
-            self.gate_fusion = nn.Sequential(
-                nn.Linear(embed_dim * 3, embed_dim),
-                nn.ReLU(),
-                nn.Linear(embed_dim, 3),
-                nn.Softmax(dim=-1)
-            )
-
-            self.proj_img = nn.Linear(embed_dim, fused_dim)
-            self.proj_sc = nn.Linear(embed_dim, fused_dim)
-            self.proj_st = nn.Linear(embed_dim, fused_dim)
-
-            self.gate_final = nn.Sequential(
-                nn.Linear(fused_dim, fused_dim),
-                nn.ReLU(),
+            self.norm1 = nn.LayerNorm(embed_dim)
+            self.ffn = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim * 4, embed_dim),
                 nn.Dropout(dropout)
             )
+            self.norm2    = nn.LayerNorm(embed_dim)
+            self.out_proj = nn.Linear(embed_dim, fused_dim)
 
         else:
-
-            raise ValueError(f"Unknown fusion option={fusion_option}")
+            raise ValueError(
+                f"Unknown fusion_option='{fusion_option}'. "
+                f"Choose from: 'concat', 'attn', 'spatial_attn'"
+            )
 
     def forward(self, img_feat: torch.Tensor, sc_feat: torch.Tensor, st_feat: torch.Tensor) -> torch.Tensor:
 
-        if img_feat.ndim != 2 or st_feat.ndim != 2 or sc_feat.ndim != 2:
+        if img_feat.ndim != 2 or sc_feat.ndim != 2 or st_feat.ndim != 2:
             raise ValueError("Input features must be 2D tensors of shape (B, D)")
-
         if not (img_feat.shape == sc_feat.shape == st_feat.shape):
             raise ValueError(f"Shape mismatch: {img_feat.shape} vs {sc_feat.shape} vs {st_feat.shape}")
-
         if not (img_feat.device == sc_feat.device == st_feat.device):
             raise ValueError(f"Device mismatch: {img_feat.device} vs {sc_feat.device} vs {st_feat.device}")
-
         if not (img_feat.dtype == sc_feat.dtype == st_feat.dtype):
             raise ValueError(f"Dtype mismatch: {img_feat.dtype} vs {sc_feat.dtype} vs {st_feat.dtype}")
 
         img_feat = self.pre_norm_img(img_feat)
-        sc_feat = self.pre_norm_sc(sc_feat)
-        st_feat = self.pre_norm_st(st_feat)
+        sc_feat  = self.pre_norm_sc(sc_feat)
+        st_feat  = self.pre_norm_st(st_feat)
 
         if self.fusion_option == 'concat':
 
@@ -284,66 +264,23 @@ class FusionLayer(nn.Module):
 
         elif self.fusion_option == 'attn':
 
-            tokens = torch.stack([img_feat, sc_feat, st_feat], dim=1)
-
+            tokens = torch.stack([img_feat, sc_feat, st_feat], dim=1)  # (B, 3, D)
             attn_out, _ = self.attn_fusion(tokens, tokens, tokens)
             tokens = self.norm1(tokens + attn_out)
+            tokens = self.norm2(tokens + self.ffn(tokens))
+            return self.out_proj(tokens.mean(dim=1))
 
-            ffn_out = self.ffn(tokens)
-            tokens = self.norm2(tokens + ffn_out)
+        elif self.fusion_option == 'spatial_attn':
 
-            pooled = tokens.mean(dim=1)
+            # Q: spatial position embedding  (B, 1, D)
+            # K/V: image + expression features  (B, 2, D)
+            q  = st_feat.unsqueeze(1)
+            kv = torch.stack([img_feat, sc_feat], dim=1)
 
-            return self.out_proj(pooled)
-
-        elif self.fusion_option == 'sim':
-
-            img_n = img_feat
-            sc_n = sc_feat
-            st_n = st_feat
-
-            img_norm = F.normalize(img_feat, p=2, dim=1, eps=1e-8)
-            sc_norm = F.normalize(sc_feat, p=2, dim=1, eps=1e-8)
-            st_norm = F.normalize(st_feat, p=2, dim=1, eps=1e-8)
-
-            cos_img_sc = F.cosine_similarity(img_norm, sc_norm, dim=1).unsqueeze(1)
-            cos_img_st = F.cosine_similarity(img_norm, st_norm, dim=1).unsqueeze(1)
-            cos_sc_st = F.cosine_similarity(sc_norm, st_norm, dim=1).unsqueeze(1)
-
-            prod_img_sc = img_n * sc_n
-            prod_img_st = img_n * st_n
-            prod_sc_st = sc_n * st_n
-
-            diff_img_sc = torch.abs(img_n - sc_n)
-            diff_img_st = torch.abs(img_n - st_n)
-            diff_sc_st = torch.abs(sc_n - st_n)
-
-            x = torch.cat([
-                img_n, sc_n, st_n,
-                prod_img_sc, prod_img_st, prod_sc_st,
-                diff_img_sc, diff_img_st, diff_sc_st,
-                cos_img_sc, cos_img_st, cos_sc_st
-            ], dim=1)
-
-            return self.sim_fusion(x)
-
-        elif self.fusion_option == 'gate':
-
-            x = torch.cat([img_feat, sc_feat, st_feat], dim=-1)
-
-            weights = self.gate_fusion(x)
-
-            proj_img = self.proj_img(img_feat)
-            proj_sc = self.proj_sc(sc_feat)
-            proj_st = self.proj_st(st_feat)
-
-            weighted = (
-                weights[:, 0:1] * proj_img +
-                weights[:, 1:2] * proj_sc +
-                weights[:, 2:3] * proj_st
-            )
-
-            return self.gate_final(weighted)
+            attn_out, _ = self.cross_attn(q, kv, kv)       # (B, 1, D)
+            out = self.norm1(attn_out.squeeze(1) + st_feat) # residual with position
+            out = self.norm2(out + self.ffn(out.unsqueeze(1)).squeeze(1))
+            return self.out_proj(out)
 
 
 # =======================================================
@@ -450,7 +387,6 @@ class MultiModalMILModel(nn.Module):
             fused_dim=embed_dim,
             attn_heads=4,
             dropout=fusion_dropout,
-            use_l2norm_for_sim=True,
         )
 
         self.mil_pooling = MILAttentionPooling(
